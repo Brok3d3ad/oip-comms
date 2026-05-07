@@ -98,6 +98,16 @@ static void host_to_be64(uint64_t v, uint8_t *p) {
 	host_to_be32((uint32_t)v, p + 4);
 }
 
+static bool opc_ua_status_indicates_dead_session(UA_StatusCode code) {
+	return code == UA_STATUSCODE_BADSESSIONIDINVALID
+		|| code == UA_STATUSCODE_BADSESSIONCLOSED
+		|| code == UA_STATUSCODE_BADSESSIONNOTACTIVATED
+		|| code == UA_STATUSCODE_BADSECURECHANNELIDINVALID
+		|| code == UA_STATUSCODE_BADCONNECTIONCLOSED
+		|| code == UA_STATUSCODE_BADSERVERNOTCONNECTED
+		|| code == UA_STATUSCODE_BADNOTCONNECTED;
+}
+
 static godot::String ads_err_name(long err) {
 	switch ((uint32_t)err) {
 		case 0x6:   return "Target port not found (TwinCAT not running, or wrong AMS port)";
@@ -183,6 +193,7 @@ void OIPComms::cleanup_tag_group(const String &tag_group_name) {
 			tag_group.client = nullptr;
 		}
 		tag_group.opc_ua_tags.clear();
+		tag_group.needs_session_recovered_signal = false;
 
 	} else if (tag_group.protocol == "rtde") {
 		if (tag_group.rtde_impl != nullptr) {
@@ -295,6 +306,9 @@ void OIPComms::opc_write(const String &tag_group_name, const String &tag_path) {
 	UA_StatusCode ret_val = UA_Client_writeValueAttribute(tag_group.client, tag.node_id, &(tag.value));
 	if (ret_val != UA_STATUSCODE_GOOD) {
 		print("OIP Comms: Failed to write tag value for " + tag_path + " with status code " + String(UA_StatusCode_name(ret_val)), true);
+		if (opc_ua_status_indicates_dead_session(ret_val)) {
+			invalidate_opc_ua_session(tag_group_name, ret_val);
+		}
 	}
 }
 
@@ -622,7 +636,8 @@ void OIPComms::process_opc_ua_tag_group(const String &tag_group_name) {
 
 		if (!tag.initialized) {
 			if (!init_opc_ua_tag(tag_group_name, tag_path)) {
-				tag_group.has_error = true;
+				print("Stopping simulation: failed to initialize OPC UA tag '" + tag_path + "' in group '" + tag_group_name + "'. The tag may not exist on the PLC, or may have been renamed or deleted.", true);
+				set_sim_running(false);
 				return;
 			}
 		}
@@ -630,8 +645,13 @@ void OIPComms::process_opc_ua_tag_group(const String &tag_group_name) {
 		if (tag.initialized) {
 			UA_StatusCode ret_val = UA_Client_readValueAttribute(tag_group.client, tag.node_id, &(tag.value));
 			if (ret_val != UA_STATUSCODE_GOOD) {
-				print("OPC UA failed to read " + tag_path + " with status code " + String(UA_StatusCode_name(ret_val)), true);
-				tag_group.has_error = true;
+				if (opc_ua_status_indicates_dead_session(ret_val)) {
+					print("OPC UA failed to read " + tag_path + " with status code " + String(UA_StatusCode_name(ret_val)), true);
+					invalidate_opc_ua_session(tag_group_name, ret_val);
+				} else {
+					print("Stopping simulation: OPC UA tag '" + tag_path + "' in group '" + tag_group_name + "' is invalid (" + String(UA_StatusCode_name(ret_val)) + "). The tag may not exist on the PLC, or may have been renamed or deleted.", true);
+					set_sim_running(false);
+				}
 				return;
 			}
 		}
@@ -713,6 +733,31 @@ bool OIPComms::opc_ua_client_connected(const String &tag_group_name) {
 	if (client_status != UA_STATUSCODE_GOOD)
 		return false;
 	return true;
+}
+
+void OIPComms::invalidate_opc_ua_session(const String &tag_group_name, UA_StatusCode reason) {
+	TagGroup &tag_group = tag_groups[tag_group_name];
+
+	print("OPC UA session for tag group [" + tag_group_name + "] invalidated (" + String(UA_StatusCode_name(reason)) + "), tags will be re-resolved on reconnect");
+
+	if (tag_group.client != nullptr) {
+		UA_Client_disconnect(tag_group.client);
+		UA_Client_delete(tag_group.client);
+		tag_group.client = nullptr;
+	}
+
+	for (auto &x : tag_group.opc_ua_tags) {
+		OpcUaTag &tag = x.second;
+		if (tag.initialized) {
+			tag.initialized = false;
+			UA_NodeId_clear(&tag.node_id);
+			UA_Variant_clear(&tag.value);
+		}
+	}
+
+	tag_group.init_count = 0;
+	tag_group.has_error = false;
+	tag_group.needs_session_recovered_signal = true;
 }
 
 bool OIPComms::ads_device_connected(const String &tag_group_name) {
@@ -1099,7 +1144,9 @@ void OIPComms::process() {
 
 			// check for tag initialization after 500 ms
 			// TBD -> there might be a better solution - not sure yet
-			if (startup_timer >= register_wait_time && !tag_group.init_count_emitted) {
+			bool first_init_pending = startup_timer >= register_wait_time && !tag_group.init_count_emitted;
+			bool recovery_pending = tag_group.needs_session_recovered_signal;
+			if (first_init_pending || recovery_pending) {
 				size_t total_tag_count = 0;
 				if (tag_group.protocol == "opc_ua")
 					total_tag_count = tag_group.opc_ua_tags.size();
@@ -1111,9 +1158,16 @@ void OIPComms::process() {
 					total_tag_count = tag_group.plc_tags.size();
 
 				if (tag_group.init_count >= total_tag_count) {
-					emit_signal("tag_group_initialized", tag_group_name);
-					print("Tag group initialized: " + tag_group_name);
-					tag_group.init_count_emitted = true;
+					if (first_init_pending) {
+						emit_signal("tag_group_initialized", tag_group_name);
+						print("Tag group initialized: " + tag_group_name);
+						tag_group.init_count_emitted = true;
+					}
+					if (recovery_pending) {
+						emit_signal("opc_ua_session_recovered", tag_group_name);
+						print("OPC UA session recovered for tag group: " + tag_group_name);
+						tag_group.needs_session_recovered_signal = false;
+					}
 				}
 			}
 		}
@@ -1190,11 +1244,13 @@ void OIPComms::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("browse_connect", "endpoint"), &OIPComms::browse_connect);
 	ClassDB::bind_method(D_METHOD("browse_disconnect"), &OIPComms::browse_disconnect);
+	ClassDB::bind_method(D_METHOD("browse_is_alive"), &OIPComms::browse_is_session_alive);
 	ClassDB::bind_method(D_METHOD("browse_children", "node_id"), &OIPComms::browse_children);
 	ClassDB::bind_method(D_METHOD("browse_node_info", "node_id"), &OIPComms::browse_node_info);
 
 	ADD_SIGNAL(MethodInfo("tag_group_polled", PropertyInfo(Variant::STRING, "tag_group_name")));
 	ADD_SIGNAL(MethodInfo("tag_group_initialized", PropertyInfo(Variant::STRING, "tag_group_name")));
+	ADD_SIGNAL(MethodInfo("opc_ua_session_recovered", PropertyInfo(Variant::STRING, "tag_group_name")));
 	ADD_SIGNAL(MethodInfo("comms_error"));
 	ADD_SIGNAL(MethodInfo("tag_groups_registered"));
 	ADD_SIGNAL(MethodInfo("enable_comms_changed"));
@@ -1377,6 +1433,7 @@ bool OIPComms::browse_connect(const String p_endpoint) {
 		return false;
 	}
 
+	browse_endpoint = endpoint;
 	print("Browse client connected to " + p_endpoint);
 	return true;
 }
@@ -1386,8 +1443,40 @@ void OIPComms::browse_disconnect() {
 		UA_Client_disconnect(browse_client);
 		UA_Client_delete(browse_client);
 		browse_client = nullptr;
+		browse_endpoint = "";
 		print("Browse client disconnected");
 	}
+}
+
+bool OIPComms::browse_is_session_alive() {
+	if (browse_client == nullptr) return false;
+	UA_SecureChannelState ch = UA_SECURECHANNELSTATE_CLOSED;
+	UA_SessionState ss = UA_SESSIONSTATE_CLOSED;
+	UA_StatusCode connect_status = UA_STATUSCODE_GOOD;
+	UA_Client_getState(browse_client, &ch, &ss, &connect_status);
+	return ch == UA_SECURECHANNELSTATE_OPEN && ss == UA_SESSIONSTATE_ACTIVATED;
+}
+
+bool OIPComms::browse_reconnect() {
+	if (browse_endpoint.is_empty()) {
+		print("Cannot reconnect browse client: no saved endpoint", true);
+		return false;
+	}
+	String endpoint = browse_endpoint;
+	print("Reconnecting browse client to " + endpoint);
+	return browse_connect(endpoint);
+}
+
+bool OIPComms::ensure_browse_session() {
+	if (browse_client == nullptr) {
+		print("Browse client not connected", true);
+		return false;
+	}
+	if (browse_is_session_alive()) {
+		return true;
+	}
+	print("Browse session not active, attempting reconnect");
+	return browse_reconnect();
 }
 
 static String node_class_to_string(UA_NodeClass nc) {
@@ -1415,8 +1504,7 @@ static String ua_node_id_to_string(const UA_NodeId &id) {
 Array OIPComms::browse_children(const String p_node_id) {
 	Array results;
 
-	if (browse_client == nullptr) {
-		print("Browse client not connected", true);
+	if (!ensure_browse_session()) {
 		return results;
 	}
 
@@ -1439,6 +1527,25 @@ Array OIPComms::browse_children(const String p_node_id) {
 
 	UA_BrowseResult br = UA_Client_browse(browse_client, nullptr, 0, &bd);
 
+	if (opc_ua_status_indicates_dead_session(br.statusCode)) {
+		UA_StatusCode dead_code = br.statusCode;
+		print(String("Browse session dropped (") + UA_StatusCode_name(dead_code) + "), reconnecting");
+		UA_BrowseResult_clear(&br);
+		if (browse_reconnect()) {
+			br = UA_Client_browse(browse_client, nullptr, 0, &bd);
+		} else {
+			UA_NodeId_clear(&parent_id);
+			return results;
+		}
+	}
+
+	if (br.statusCode != UA_STATUSCODE_GOOD) {
+		print(String("Browse failed: ") + UA_StatusCode_name(br.statusCode), true);
+		UA_BrowseResult_clear(&br);
+		UA_NodeId_clear(&parent_id);
+		return results;
+	}
+
 	while (true) {
 		for (size_t i = 0; i < br.referencesSize; i++) {
 			UA_ReferenceDescription &ref = br.references[i];
@@ -1458,6 +1565,11 @@ Array OIPComms::browse_children(const String p_node_id) {
 		UA_ByteString cp = br.continuationPoint;
 		UA_BrowseResult_clear(&br);
 		br = UA_Client_browseNext(browse_client, false, cp);
+
+		if (br.statusCode != UA_STATUSCODE_GOOD) {
+			print(String("BrowseNext failed: ") + UA_StatusCode_name(br.statusCode), true);
+			break;
+		}
 	}
 
 	UA_BrowseResult_clear(&br);
@@ -1501,8 +1613,7 @@ static String ua_variant_to_string(const UA_Variant &value) {
 Dictionary OIPComms::browse_node_info(const String p_node_id) {
 	Dictionary info;
 
-	if (browse_client == nullptr) {
-		print("Browse client not connected", true);
+	if (!ensure_browse_session()) {
 		return info;
 	}
 
@@ -1519,7 +1630,15 @@ Dictionary OIPComms::browse_node_info(const String p_node_id) {
 
 	UA_Variant value;
 	UA_Variant_init(&value);
-	if (UA_Client_readValueAttribute(browse_client, node_id, &value) == UA_STATUSCODE_GOOD) {
+	UA_StatusCode value_status = UA_Client_readValueAttribute(browse_client, node_id, &value);
+	if (opc_ua_status_indicates_dead_session(value_status)) {
+		print(String("Browse session dropped (") + UA_StatusCode_name(value_status) + "), reconnecting");
+		UA_Variant_clear(&value);
+		UA_NodeId_clear(&node_id);
+		browse_reconnect();
+		return info;
+	}
+	if (value_status == UA_STATUSCODE_GOOD) {
 		info["value"] = ua_variant_to_string(value);
 		info["type"] = (value.type != nullptr) ? String(value.type->typeName) : String("Unknown");
 	} else {

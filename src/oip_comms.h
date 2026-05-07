@@ -80,6 +80,8 @@ private:
 		AdsTagGroupImpl *ads_impl;
 
 		RtdeTagGroupImpl *rtde_impl;
+
+		bool needs_session_recovered_signal = false;
 	};
 	std::map<String, TagGroup> tag_groups;
 	std::vector<String> tag_group_order;
@@ -101,6 +103,11 @@ private:
 	OIPBlockingQueue tag_group_queue;
 
 	UA_Client *browse_client = nullptr;
+	String browse_endpoint;
+
+	bool browse_is_session_alive();
+	bool ensure_browse_session();
+	bool browse_reconnect();
 
 	uint64_t last_ticks = 0;
 
@@ -131,6 +138,7 @@ private:
 	bool init_rtde_session(const String &tag_group_name);
 
 	bool opc_ua_client_connected(const String &tag_group_name);
+	void invalidate_opc_ua_session(const String &tag_group_name, UA_StatusCode reason);
 	bool ads_device_connected(const String &tag_group_name);
 	bool rtde_session_started(const String &tag_group_name);
 	bool tag_group_exists(const String &tag_group_name);
