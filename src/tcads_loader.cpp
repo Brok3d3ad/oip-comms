@@ -1,6 +1,6 @@
 #include "tcads_loader.h"
 
-#ifdef _WIN32
+#ifdef USE_TWINCAT_ROUTER
 
 #include <windows.h>
 #include <delayimp.h>
@@ -20,10 +20,9 @@ static bool try_load(const std::string &path)
 	return false;
 }
 
-// Read ConnectionProvider value from HKLM\SOFTWARE\WOW6432Node\Beckhoff\TwinCAT3\System
-// and derive the install root. ConnectionProvider points at e.g.
-//   "C:\Program Files (x86)\Beckhoff\TwinCAT\3.1\System\TcComPortConnection.dll"
-// The install root is the path before "\3.1\System\".
+// HKLM\...\TwinCAT3\System\ConnectionProvider points at a DLL inside the
+// install (e.g. "<root>\3.1\System\TcComPortConnection.dll"); the install
+// root is the path before that marker.
 static std::string tc_install_root_from_registry()
 {
 	HKEY key;

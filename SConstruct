@@ -40,26 +40,34 @@ env.Append(LIBPATH=["lib/"])
 env.Append(LIBS=["plctag", "open62541"])
 env.Append(CPPDEFINES=[("CONFIG_DEFAULT_LOGLEVEL", "1")])
 
-# ADS variant selection. On Windows we use Beckhoff's installed TcAdsDll because
-# TC3 4026's Secure ADS enforcement silently drops the standalone library's plain-TCP
-# requests. On Linux/macOS, TcAdsDll is unavailable, so we fall back to the standalone
-# library, which works correctly when connecting to a remote TwinCAT system (its
-# documented use case).
+# Local TC3 4026 connections require the TwinCAT variant; TC3 4026 enforces
+# Secure ADS by default and silently drops requests from the standalone
+# library (manifests as 0x745 sync timeout). Standalone variant works fine
+# for remote TwinCAT systems. Auto-detect by probing for TcAdsDef.h; without
+# TwinCAT installed the build still succeeds via standalone.
 ads_sources_dir = "ads/AdsLib/standalone"
+beckhoff_ads_root = "C:/Program Files (x86)/Beckhoff/TwinCAT/AdsApi/TcAdsDll"
+have_twincat_sdk = (
+    env["platform"] == "windows"
+    and os.path.isfile(beckhoff_ads_root + "/Include/TcAdsDef.h")
+)
+
 if env["platform"] == "windows":
     env.Append(CXXFLAGS=["/MT", "/EHsc"])
     env.Append(LIBS=["ws2_32"])
-    env.Append(CPPDEFINES=["USE_TWINCAT_ROUTER"])
-    beckhoff_ads_root = "C:/Program Files (x86)/Beckhoff/TwinCAT/AdsApi/TcAdsDll"
-    env.Append(CPPPATH=[beckhoff_ads_root + "/Include"])
-    env.Append(LIBPATH=[beckhoff_ads_root + "/Lib/x64"])
-    env.Append(LIBS=["TcAdsDll", "delayimp", "Advapi32"])
-    # Delay-load TcAdsDll so the import isn't resolved at our DLL's load time;
-    # register_types.cpp's preload_tc_ads_dll() runs first and pulls TcAdsDll.dll
-    # in from its standard install path, sidestepping any PATH-staleness in the
-    # host process (e.g., Godot started before TwinCAT was installed).
-    env.Append(LINKFLAGS=["/DELAYLOAD:TcAdsDll.dll"])
-    ads_sources_dir = "ads/AdsLib/TwinCAT"
+    if have_twincat_sdk:
+        print("ADS variant: TwinCAT (TcAdsDll detected at " + beckhoff_ads_root + ")")
+        env.Append(CPPDEFINES=["USE_TWINCAT_ROUTER"])
+        env.Append(CPPPATH=[beckhoff_ads_root + "/Include"])
+        env.Append(LIBPATH=[beckhoff_ads_root + "/Lib/x64"])
+        env.Append(LIBS=["TcAdsDll", "delayimp", "Advapi32"])
+        # Delay-load so preload_tc_ads_dll() can resolve TcAdsDll from its
+        # install path before any import is touched — works around stale PATH
+        # in host processes started before TwinCAT was installed.
+        env.Append(LINKFLAGS=["/DELAYLOAD:TcAdsDll.dll"])
+        ads_sources_dir = "ads/AdsLib/TwinCAT"
+    else:
+        print("ADS variant: standalone (TcAdsDll not found at " + beckhoff_ads_root + ")")
 else:
     env.Append(LINKFLAGS=["-static"])
 sources = (
