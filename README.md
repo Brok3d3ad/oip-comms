@@ -8,6 +8,7 @@ This component is for the Open Industry Project (OIP). It exposes a single `OIPC
 | `s7` | Siemens S7 PUT/GET | vendored in [src/S7Com.cpp](src/S7Com.cpp) |
 | `ads` | [Beckhoff/ADS](https://github.com/Beckhoff/ADS) | git submodule under `ads/` |
 | `rtde` | Universal Robots Real-Time Data Exchange (v2) | hand-rolled in [src/rtde_client.cpp](src/rtde_client.cpp), no external dep |
+| `mqtt` | [Eclipse Paho MQTT C](https://github.com/eclipse-paho/paho.mqtt.c) (synchronous client) | git submodule under `paho/`, compiled inline (no separate `.dll` to ship) |
 
 Prebuilt-library commits (built from source, dropped into `lib/`):
 - https://github.com/libplctag/libplctag/commit/c55bc5876d938dda1c609750cde5ae4812d7b8a8
@@ -31,6 +32,20 @@ Tag names follow UR's RTDE variable vocabulary. Vector fields are read element-b
 - `input_double_register_0` — writable DOUBLE register (write with `write_float64`).
 
 Tag names that begin with `input_` are routed to the input recipe automatically and are writable from this side; everything else lives in the output recipe and is read-only.
+
+## MQTT specifics
+The MQTT backend talks to any MQTT 3.1.1 broker over plain TCP (the MVP does not yet support TLS, QoS 1/2, or retained messages). Each registered tag name is treated as one MQTT topic; the broker payload is interpreted as a raw little-endian scalar matching whichever `read_*`/`write_*` API is used to access it. There is no JSON/text decoding; the producer side is expected to publish the same byte layout the consumer reads.
+
+Tag-group fields:
+- **Gateway**: broker host with optional port. Accepts `host`, `host:port`, or a full `tcp://host:port` URI. Port defaults to 1883.
+- **Path**: MQTT client ID. Leave empty to use an auto-generated id (`oip_comms_<group>_<addr>`).
+- **CPU**: optional credentials as `user:password`. Empty means anonymous; `user` alone (no colon) is sent without a password.
+
+Tag names map directly to topics, e.g. `sensors/temp1`, `factory/line_a/state`. MQTT wildcards (`+`, `#`) are not supported; each tag is one specific topic.
+
+A poll cycle does not perform any per-tag work for MQTT: subscriptions are issued once at session start, then Paho's receiver thread fills the per-tag value cache as messages arrive. `polling_interval` therefore controls only the reconnect/health-check cadence, not the read rate.
+
+Paho is a git submodule at `paho/` pinned to v1.3.13; its `.c` sources are compiled directly into `OIP-COMMS.dll` (no separate `paho-mqtt3c.dll` to ship). The sync-client subset is built; async, TLS, and the standalone version CLI are skipped. The version string Paho exposes at runtime is hard-coded in [src/VersionInfo.h](src/VersionInfo.h) and should be bumped when the submodule is updated.
 
 See PR on Open Industry Project [https://github.com/open62541/open62541](https://github.com/Open-Industry-Project/Open-Industry-Project/pull/161)
 

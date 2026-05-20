@@ -16,6 +16,7 @@
 
 struct AdsTagGroupImpl;
 struct RtdeTagGroupImpl;
+struct MqttTagGroupImpl;
 
 namespace godot {
 
@@ -81,6 +82,8 @@ private:
 
 		RtdeTagGroupImpl *rtde_impl;
 
+		MqttTagGroupImpl *mqtt_impl;
+
 		bool needs_session_recovered_signal = false;
 	};
 	std::map<String, TagGroup> tag_groups;
@@ -126,6 +129,7 @@ private:
 	void process_opc_ua_tag_group(const String &tag_group_name);
 	void process_ads_tag_group(const String &tag_group_name);
 	void process_rtde_tag_group(const String &tag_group_name);
+	void process_mqtt_tag_group(const String &tag_group_name);
 
 	bool init_plc_tag(const String &tag_group_name, const String &tag_name);
 
@@ -137,10 +141,14 @@ private:
 
 	bool init_rtde_session(const String &tag_group_name);
 
+	bool init_mqtt_client(const String &tag_group_name);
+	bool init_mqtt_tag(const String &tag_group_name, const String &tag_name);
+
 	bool opc_ua_client_connected(const String &tag_group_name);
 	void invalidate_opc_ua_session(const String &tag_group_name, UA_StatusCode reason);
 	bool ads_device_connected(const String &tag_group_name);
 	bool rtde_session_started(const String &tag_group_name);
+	bool mqtt_client_connected(const String &tag_group_name);
 	bool tag_group_exists(const String &tag_group_name);
 	bool tag_exists(const String &tag_group_name, const String &tag_name);
 
@@ -185,6 +193,20 @@ private:
 	OIP_DECLARE_ADS_SET(float32)
 
 	void rtde_tag_set(const String &tag_group_name, const String &tag_path, const godot::Variant value);
+
+#define OIP_DECLARE_MQTT_SET(a)void mqtt_tag_set_##a(const String &tag_group_name, const String &tag_path, const godot::Variant value);
+
+	OIP_DECLARE_MQTT_SET(bit)
+	OIP_DECLARE_MQTT_SET(uint64)
+	OIP_DECLARE_MQTT_SET(int64)
+	OIP_DECLARE_MQTT_SET(uint32)
+	OIP_DECLARE_MQTT_SET(int32)
+	OIP_DECLARE_MQTT_SET(uint16)
+	OIP_DECLARE_MQTT_SET(int16)
+	OIP_DECLARE_MQTT_SET(uint8)
+	OIP_DECLARE_MQTT_SET(int8)
+	OIP_DECLARE_MQTT_SET(float64)
+	OIP_DECLARE_MQTT_SET(float32)
 
 	void cleanup_tag_groups();
 	void cleanup_tag_group(const String &tag_group_name);

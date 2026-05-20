@@ -35,10 +35,27 @@ Run the following command to download godot-cpp:
 
 env = SConscript("godot-cpp/SConstruct", {"env": env, "customs": customs})
 
-env.Append(CPPPATH=["src/", "ads/AdsLib/"])
+# paho/src/ goes LAST on purpose: ADS and Paho both ship an internal "Log.h",
+# and ADS's .cpp files must resolve to ads/AdsLib/Log.h. oip_comms.cpp still
+# finds MQTTClient.h here (no name collision). Paho's own .c files need the
+# reverse order, so they build with a cloned env (see paho_env below).
+env.Append(CPPPATH=["src/", "ads/AdsLib/", "paho/src/"])
 env.Append(LIBPATH=["lib/"])
 env.Append(LIBS=["plctag", "open62541"])
 env.Append(CPPDEFINES=[("CONFIG_DEFAULT_LOGLEVEL", "1")])
+
+# With neither PAHO_MQTT_EXPORTS nor PAHO_MQTT_IMPORTS defined, Paho's
+# LIBMQTT_API expands to nothing, which is what we want when compiling its
+# sources directly into OIP-COMMS.dll (static link). MQTTClient.c also includes
+# "VersionInfo.h" (normally cmake-generated); we ship a stub at src/VersionInfo.h.
+paho_sources_skip = {
+    # async client (we use the sync MQTTClient API exclusively)
+    "MQTTAsync.c", "MQTTAsyncUtils.c",
+    # TLS support (out of scope for the MVP; pulls OpenSSL)
+    "SSLSocket.c",
+    # standalone "print client version" CLI helper
+    "MQTTVersion.c",
+}
 
 # Local TC3 4026 connections require the TwinCAT variant; TC3 4026 enforces
 # Secure ADS by default and silently drops requests from the standalone
@@ -70,11 +87,32 @@ if env["platform"] == "windows":
         print("ADS variant: standalone (TcAdsDll not found at " + beckhoff_ads_root + ")")
 else:
     env.Append(LINKFLAGS=["-static"])
+# Paho's .c files need paho/src/ FIRST so their internal "Log.h" wins over ADS's
+# (the reverse of the main env's order). The clone also isolates Paho-only defines.
+paho_env = env.Clone()
+paho_env.Replace(CPPPATH=["paho/src/", "src/", "ads/AdsLib/"])
+if env["platform"] == "windows":
+    # WIN32_LEAN_AND_MEAN keeps <windows.h> from pulling the legacy <winsock.h>,
+    # which otherwise collides with the <winsock2.h> Paho actually uses. The
+    # _CRT/_WINSOCK_DEPRECATED defines just silence MSVC warning noise.
+    paho_env.Append(CPPDEFINES=[
+        "WIN32_LEAN_AND_MEAN",
+        "_CRT_SECURE_NO_WARNINGS",
+        "_WINSOCK_DEPRECATED_NO_WARNINGS",
+    ])
+
+paho_objects = [
+    paho_env.SharedObject(str(node))
+    for node in Glob("paho/src/*.c")
+    if os.path.basename(str(node)) not in paho_sources_skip
+]
+
 sources = (
     Glob("src/*.cpp")
     + Glob("ads/AdsLib/*.cpp")
     + Glob("ads/AdsLib/bhf/*.cpp")
     + Glob(ads_sources_dir + "/*.cpp")
+    + paho_objects
 )
 
 if env["target"] in ["editor", "template_debug"]:

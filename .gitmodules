@@ -5,3 +5,11 @@
 [submodule "ads"]
 	path = ads
 	url = https://github.com/Beckhoff/ADS.git
+[submodule "paho"]
+	path = paho
+	url = https://github.com/eclipse-paho/paho.mqtt.c.git
+	# Paho's own .gitignore doesn't cover *.obj; scons drops object files into
+	# paho/src/ during the inline build, which would otherwise make `git status`
+	# report the submodule as dirty on every build. ADS sidesteps this with its
+	# own .gitignore.
+	ignore = dirty

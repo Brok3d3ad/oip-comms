@@ -12,8 +12,10 @@
 #include "AdsException.h"
 #include "tcads_loader.h"
 #include "rtde_client.h"
+#include "MQTTClient.h"
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 struct AdsTagEntry {
@@ -54,6 +56,24 @@ struct RtdeTagGroupImpl {
 	bool input_recipe_setup = false;
 	uint8_t input_recipe_id = 0;
 	std::vector<uint8_t> input_payload;
+};
+
+struct MqttTagEntry {
+	bool subscribed = false;
+	bool has_data = false;
+	std::vector<uint8_t> value;
+};
+
+struct MqttTagGroupImpl {
+	MQTTClient client = nullptr;
+	std::map<godot::String, MqttTagEntry> tags;
+
+	std::mutex tags_mutex;
+
+	std::string server_uri;
+	std::string client_id;
+	std::string username;
+	std::string password;
 };
 
 static bool parse_tag_index(const godot::String &raw, std::string &out_base, int &out_index, bool &out_has_brackets) {
@@ -144,6 +164,68 @@ static godot::String ads_err_name(long err) {
 	}
 }
 
+static std::string mqtt_build_server_uri(const godot::String &gateway) {
+	using namespace godot;
+	String g = gateway.strip_edges();
+	if (g.is_empty()) return std::string();
+	String lower = g.to_lower();
+	if (lower.begins_with("tcp://") || lower.begins_with("ssl://")
+			|| lower.begins_with("mqtt://") || lower.begins_with("mqtts://")) {
+		CharString u = g.utf8();
+		return std::string(u.get_data(), u.length());
+	}
+	if (g.find(":") < 0) g += ":1883";
+	String full = "tcp://" + g;
+	CharString u = full.utf8();
+	return std::string(u.get_data(), u.length());
+}
+
+static void mqtt_split_credentials(const godot::String &cpu, std::string &user, std::string &pass) {
+	using namespace godot;
+	user.clear();
+	pass.clear();
+	String c = cpu.strip_edges();
+	if (c.is_empty()) return;
+	int colon = c.find(":");
+	if (colon < 0) {
+		godot::CharString u = c.utf8();
+		user.assign(u.get_data(), u.length());
+		return;
+	}
+	String u = c.substr(0, colon);
+	String p = c.substr(colon + 1, c.length() - colon - 1);
+	godot::CharString uu = u.utf8();
+	godot::CharString pp = p.utf8();
+	user.assign(uu.get_data(), uu.length());
+	pass.assign(pp.get_data(), pp.length());
+}
+
+static int mqtt_message_arrived(void *context, char *topicName, int topicLen,
+		MQTTClient_message *message) {
+	MqttTagGroupImpl *impl = reinterpret_cast<MqttTagGroupImpl *>(context);
+	if (impl != nullptr && topicName != nullptr && message != nullptr) {
+		size_t len = (topicLen > 0) ? (size_t)topicLen : std::strlen(topicName);
+		godot::String topic = godot::String::utf8(topicName, (int)len);
+
+		std::lock_guard<std::mutex> lk(impl->tags_mutex);
+		auto it = impl->tags.find(topic);
+		if (it != impl->tags.end()) {
+			MqttTagEntry &tag = it->second;
+			const uint8_t *p = reinterpret_cast<const uint8_t *>(message->payload);
+			tag.value.assign(p, p + message->payloadlen);
+			tag.has_data = true;
+		}
+	}
+	MQTTClient_freeMessage(&message);
+	MQTTClient_free(topicName);
+	return 1; // tell Paho the message was handled successfully
+}
+
+static void mqtt_connection_lost(void *context, char *cause) {
+	(void)context;
+	(void)cause;
+}
+
 using namespace godot;
 
 OIPComms::OIPComms() {
@@ -204,6 +286,17 @@ void OIPComms::cleanup_tag_group(const String &tag_group_name) {
 		if (tag_group.ads_impl != nullptr) {
 			delete tag_group.ads_impl;
 			tag_group.ads_impl = nullptr;
+		}
+	} else if (tag_group.protocol == "mqtt") {
+		if (tag_group.mqtt_impl != nullptr) {
+			MqttTagGroupImpl &impl = *tag_group.mqtt_impl;
+			if (impl.client != nullptr) {
+				MQTTClient_disconnect(impl.client, 1000);
+				MQTTClient_destroy(&impl.client);
+				impl.client = nullptr;
+			}
+			delete tag_group.mqtt_impl;
+			tag_group.mqtt_impl = nullptr;
 		}
 	} else if (tag_group.protocol == "s7") {
 		for (auto &x : tag_group.plc_tags) {
@@ -465,6 +558,8 @@ if (tag_group.protocol == "opc_ua") {                                           
 	ads_tag_set_##a(write_req.tag_group_name, write_req.tag_name, write_req.value); \
 } else if (tag_group.protocol == "rtde") {                                          \
 	rtde_tag_set(write_req.tag_group_name, write_req.tag_name, write_req.value);    \
+} else if (tag_group.protocol == "mqtt") {                                          \
+	mqtt_tag_set_##a(write_req.tag_group_name, write_req.tag_name, write_req.value);\
 } else if (tag_group.protocol == "s7") {                                            \
 		if (tag_pointer >= 0) S7_tag_set_##a(tag_pointer, write_req.value);         \
 }                                                                                   \
@@ -477,7 +572,7 @@ void OIPComms::process_write(const WriteRequest &write_req) {
 
 	int32_t tag_pointer = -1;
 	if (tag_group.protocol != "opc_ua" && tag_group.protocol != "ads"
-			&& tag_group.protocol != "rtde") {
+			&& tag_group.protocol != "rtde" && tag_group.protocol != "mqtt") {
 		PlcTag &tag = tag_group.plc_tags[write_req.tag_name];
 		tag_pointer = tag.tag_pointer;
 	}
@@ -519,9 +614,9 @@ void OIPComms::process_write(const WriteRequest &write_req) {
 	}
 
 	// libplctag and S7 cache the value above; this issues the actual network write.
-	// opc_ua, ads, and rtde write inline in their per-type set helpers.
+	// opc_ua, ads, rtde, and mqtt write inline in their per-type set helpers.
 	if (tag_group.protocol != "opc_ua" && tag_group.protocol != "ads"
-			&& tag_group.protocol != "rtde") {
+			&& tag_group.protocol != "rtde" && tag_group.protocol != "mqtt") {
 		if (tag_group.protocol == "s7"){
 			if (tag_pointer >= 0 && S7_tag_write(tag_pointer) == PLCTAG_STATUS_OK) {
 				tag_groups[write_req.tag_group_name].plc_tags[write_req.tag_name].dirty = true;
@@ -552,6 +647,8 @@ void OIPComms::process_tag_group(const String &tag_group_name) {
 		process_ads_tag_group(tag_group_name);
 	} else if (tag_group.protocol == "rtde") {
 		process_rtde_tag_group(tag_group_name);
+	} else if (tag_group.protocol == "mqtt") {
+		process_mqtt_tag_group(tag_group_name);
 	} else {
 		process_plc_tag_group(tag_group_name);
 	}
@@ -1092,6 +1189,176 @@ void OIPComms::process_rtde_tag_group(const String &tag_group_name) {
 	}
 }
 
+bool OIPComms::mqtt_client_connected(const String &tag_group_name) {
+	TagGroup &tag_group = tag_groups[tag_group_name];
+	if (tag_group.mqtt_impl == nullptr || tag_group.mqtt_impl->client == nullptr)
+		return false;
+	return MQTTClient_isConnected(tag_group.mqtt_impl->client) != 0;
+}
+
+bool OIPComms::init_mqtt_client(const String &tag_group_name) {
+	TagGroup &tag_group = tag_groups[tag_group_name];
+	if (tag_group.mqtt_impl == nullptr)
+		tag_group.mqtt_impl = new MqttTagGroupImpl();
+	MqttTagGroupImpl &impl = *tag_group.mqtt_impl;
+
+	if (impl.client != nullptr) {
+		MQTTClient_disconnect(impl.client, 1000);
+		MQTTClient_destroy(&impl.client);
+		impl.client = nullptr;
+	}
+	for (auto &x : impl.tags) {
+		x.second.subscribed = false;
+	}
+
+	impl.server_uri = mqtt_build_server_uri(tag_group.gateway);
+	if (impl.server_uri.empty()) {
+		print("MQTT: gateway is empty for group " + tag_group_name, true);
+		return false;
+	}
+
+	String cid = tag_group.path.strip_edges();
+	if (cid.is_empty()) {
+		// Paho accepts an empty client_id only with cleansession=1; the
+		// broker assigns one. We pass an explicit name for friendlier logs.
+		cid = "oip_comms_" + tag_group_name + "_" + itos((int64_t)(uintptr_t)this);
+	}
+	CharString cid_utf8 = cid.utf8();
+	impl.client_id.assign(cid_utf8.get_data(), cid_utf8.length());
+
+	mqtt_split_credentials(tag_group.cpu, impl.username, impl.password);
+
+	int rc = MQTTClient_create(&impl.client, impl.server_uri.c_str(),
+			impl.client_id.c_str(), MQTTCLIENT_PERSISTENCE_NONE, nullptr);
+	if (rc != MQTTCLIENT_SUCCESS) {
+		print("MQTT: client create failed for " + tag_group_name + " (rc=" + itos(rc) + ")", true);
+		impl.client = nullptr;
+		return false;
+	}
+
+	rc = MQTTClient_setCallbacks(impl.client, &impl, mqtt_connection_lost,
+			mqtt_message_arrived, nullptr);
+	if (rc != MQTTCLIENT_SUCCESS) {
+		print("MQTT: setCallbacks failed for " + tag_group_name + " (rc=" + itos(rc) + ")", true);
+		MQTTClient_destroy(&impl.client);
+		impl.client = nullptr;
+		return false;
+	}
+	MQTTClient_connectOptions opts = MQTTClient_connectOptions_initializer;
+	// Pin to 3.1.1 instead of MQTTVERSION_DEFAULT's silent "try 3.1.1, fall back
+	// to 3.1" behavior. Fails fast against brokers that refuse 3.1.1.
+	opts.MQTTVersion = MQTTVERSION_3_1_1;
+	opts.keepAliveInterval = 20;
+	opts.cleansession = 1;
+	opts.connectTimeout = 5;
+	if (!impl.username.empty()) opts.username = impl.username.c_str();
+	if (!impl.password.empty()) opts.password = impl.password.c_str();
+
+	rc = MQTTClient_connect(impl.client, &opts);
+	if (rc != MQTTCLIENT_SUCCESS) {
+		print("MQTT: connect to " + String(impl.server_uri.c_str())
+				+ " failed for " + tag_group_name + " (rc=" + itos(rc) + ")", true);
+		MQTTClient_destroy(&impl.client);
+		impl.client = nullptr;
+		return false;
+	}
+
+	print("MQTT connected to " + String(impl.server_uri.c_str())
+			+ " (client_id=" + String(impl.client_id.c_str()) + ")");
+	return true;
+}
+
+bool OIPComms::init_mqtt_tag(const String &tag_group_name, const String &tag_name) {
+	TagGroup &tag_group = tag_groups[tag_group_name];
+	if (tag_group.mqtt_impl == nullptr || tag_group.mqtt_impl->client == nullptr)
+		return false;
+	MqttTagGroupImpl &impl = *tag_group.mqtt_impl;
+
+	auto it = impl.tags.find(tag_name);
+	if (it == impl.tags.end()) return false;
+	MqttTagEntry &tag = it->second;
+	if (tag.subscribed) return true;
+
+	CharString topic_utf8 = tag_name.utf8();
+	// QoS 0 per MVP scope.
+	int rc = MQTTClient_subscribe(impl.client, topic_utf8.get_data(), 0);
+	if (rc != MQTTCLIENT_SUCCESS) {
+		print("MQTT: subscribe to '" + tag_name + "' failed (rc=" + itos(rc) + ")", true);
+		return false;
+	}
+
+	tag.subscribed = true;
+	tag_group.init_count++;
+	return true;
+}
+
+void OIPComms::process_mqtt_tag_group(const String &tag_group_name) {
+	TagGroup &tag_group = tag_groups[tag_group_name];
+
+	if (!mqtt_client_connected(tag_group_name)) {
+		// On reconnect, all subscriptions are lost; mark every tag as
+		// needing re-subscription before we try to bring the session back.
+		// Also drop cached values so the read API doesn't serve stale data
+		// from the previous session until a fresh message arrives.
+		if (tag_group.mqtt_impl != nullptr) {
+			std::lock_guard<std::mutex> lk(tag_group.mqtt_impl->tags_mutex);
+			for (auto &x : tag_group.mqtt_impl->tags) {
+				x.second.subscribed = false;
+				x.second.has_data = false;
+			}
+			tag_group.init_count = 0;
+			tag_group.init_count_emitted = false;
+		}
+		if (!init_mqtt_client(tag_group_name))
+			return;
+	}
+
+	if (tag_group.mqtt_impl == nullptr) return;
+
+	for (auto &x : tag_group.mqtt_impl->tags) {
+		const String &tag_name = x.first;
+		MqttTagEntry &tag = x.second;
+		if (!tag.subscribed) {
+			if (!init_mqtt_tag(tag_group_name, tag_name)) {
+				tag_group.has_error = true;
+				return;
+			}
+		}
+	}
+	// Data delivery is push-driven via mqtt_message_arrived(); no per-poll
+	// work needed once subscriptions are in place.
+}
+
+#define OIP_MQTT_SET(a, b, d) \
+void OIPComms::mqtt_tag_set_##a(const String &tag_group_name, const String &tag_path, const godot::Variant value) { \
+	if (value.get_type() != Variant::##d) {                                            \
+		print("OIP Comms: Supplied data type incorrect for " + tag_path, true);        \
+		return;                                                                         \
+	}                                                                                   \
+	if (!mqtt_client_connected(tag_group_name)) return;                                 \
+	TagGroup &tag_group = tag_groups[tag_group_name];                                   \
+	MqttTagGroupImpl &impl = *tag_group.mqtt_impl;                                      \
+	b raw = (b)value;                                                                   \
+	CharString topic_utf8 = tag_path.utf8();                                            \
+	MQTTClient_deliveryToken token = 0;                                                 \
+	int rc = MQTTClient_publish(impl.client, topic_utf8.get_data(),                     \
+			(int)sizeof(raw), &raw, 0 /*qos*/, 0 /*retained*/, &token);                 \
+	if (rc != MQTTCLIENT_SUCCESS)                                                        \
+		print("MQTT: publish to '" + tag_path + "' failed (rc=" + itos(rc) + ")", true);\
+}
+
+OIP_MQTT_SET(bit, bool, BOOL)
+OIP_MQTT_SET(uint64, uint64_t, INT)
+OIP_MQTT_SET(int64, int64_t, INT)
+OIP_MQTT_SET(uint32, uint32_t, INT)
+OIP_MQTT_SET(int32, int32_t, INT)
+OIP_MQTT_SET(uint16, uint16_t, INT)
+OIP_MQTT_SET(int16, int16_t, INT)
+OIP_MQTT_SET(uint8, uint8_t, INT)
+OIP_MQTT_SET(int8, int8_t, INT)
+OIP_MQTT_SET(float64, double, FLOAT)
+OIP_MQTT_SET(float32, float, FLOAT)
+
 bool OIPComms::tag_group_exists(const String& tag_group_name) {
 	return tag_groups.find(tag_group_name) != tag_groups.end();
 }
@@ -1107,6 +1374,9 @@ bool OIPComms::tag_exists(const String& tag_group_name, const String& tag_name) 
 		} else if (tag_group.protocol == "rtde") {
 			if (tag_group.rtde_impl == nullptr) return false;
 			return tag_group.rtde_impl->tags.find(tag_name) != tag_group.rtde_impl->tags.end();
+		} else if (tag_group.protocol == "mqtt") {
+			if (tag_group.mqtt_impl == nullptr) return false;
+			return tag_group.mqtt_impl->tags.find(tag_name) != tag_group.mqtt_impl->tags.end();
 		} else {
 			return tag_group.plc_tags.find(tag_name) != tag_group.plc_tags.end();
 		}
@@ -1154,6 +1424,8 @@ void OIPComms::process() {
 					total_tag_count = tag_group.ads_impl ? tag_group.ads_impl->tags.size() : 0;
 				else if (tag_group.protocol == "rtde")
 					total_tag_count = tag_group.rtde_impl ? tag_group.rtde_impl->tags.size() : 0;
+				else if (tag_group.protocol == "mqtt")
+					total_tag_count = tag_group.mqtt_impl ? tag_group.mqtt_impl->tags.size() : 0;
 				else
 					total_tag_count = tag_group.plc_tags.size();
 
@@ -1289,6 +1561,7 @@ void OIPComms::register_tag_group(const String p_tag_group_name, const int p_pol
 		std::map<String, OpcUaTag>(),
 
 		nullptr,
+		nullptr,
 		nullptr
 	};
 
@@ -1329,6 +1602,14 @@ bool OIPComms::register_tag(const String p_tag_group_name, const String p_tag_na
 				entry.has_brackets = has_brackets;
 				entry.is_input = rtde_is_input_name(base);
 				tag_group.rtde_impl->tags[p_tag_name] = entry;
+			} else if (tag_group.protocol == "mqtt") {
+				if (p_tag_name.find("+") >= 0 || p_tag_name.find("#") >= 0) {
+					print("MQTT: tag name '" + p_tag_name + "' contains wildcard ('+' or '#'); use a concrete topic", true);
+					return false;
+				}
+				if (tag_group.mqtt_impl == nullptr)
+					tag_group.mqtt_impl = new MqttTagGroupImpl();
+				tag_group.mqtt_impl->tags[p_tag_name];
 			} else {
 				PlcTag tag = { false, -1, p_elem_count, false };
 				tag_group.plc_tags[p_tag_name] = tag;
@@ -1743,6 +2024,17 @@ Dictionary OIPComms::browse_node_info(const String p_node_id) {
 					}                                                              \
 					default: return 0.0;                                           \
 				}                                                                  \
+			} else if (tag_group.protocol == "mqtt") {                            \
+				if (tag_group.mqtt_impl == nullptr) return 0.0;                   \
+				MqttTagGroupImpl &mimpl = *tag_group.mqtt_impl;                   \
+				std::lock_guard<std::mutex> lk(mimpl.tags_mutex);                 \
+				auto mit = mimpl.tags.find(p_tag_name);                           \
+				if (mit == mimpl.tags.end()) return 0.0;                          \
+				MqttTagEntry &mtag = mit->second;                                 \
+				if (!mtag.has_data || mtag.value.size() < sizeof(b)) return 0.0;  \
+				b v;                                                              \
+				std::memcpy(&v, mtag.value.data(), sizeof(b));                    \
+				return v;                                                         \
 			} else if (tag_group.protocol == "s7") {                              \
 				PlcTag tag = tag_group.plc_tags[p_tag_name];                      \
 				if (tag.initialized) {                                            \

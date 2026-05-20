@@ -98,6 +98,22 @@ Per MPL 2.0 §3.2, source code for the open62541 files is available at the upstr
 
 ---
 
+## Eclipse Paho MQTT C
+
+- **Upstream:** https://github.com/eclipse-paho/paho.mqtt.c
+- **Pinned release:** [v1.3.13](https://github.com/eclipse-paho/paho.mqtt.c/releases/tag/v1.3.13)
+- **Used as:** git submodule (`paho/`), compiled from source on all platforms; statically linked into `OIP-COMMS.dll`
+- **License:** dual-licensed, **EPL 2.0** OR **EDL 1.0** (recipient's choice)
+- **SPDX:** `EPL-2.0 OR BSD-3-Clause`
+
+Full license texts at the pinned release:
+- EPL 2.0: https://github.com/eclipse-paho/paho.mqtt.c/blob/v1.3.13/epl-v20
+- EDL 1.0 (BSD-3-Clause): https://github.com/eclipse-paho/paho.mqtt.c/blob/v1.3.13/edl-v10
+
+Per EPL 2.0 §3.2, source code for the Paho files is available at the upstream release linked above (and vendored as a git submodule).
+
+---
+
 ## TcAdsDll.dll (Beckhoff TwinCAT)
 
 - **Source:** Beckhoff TwinCAT installation (proprietary)
