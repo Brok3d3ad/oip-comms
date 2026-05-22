@@ -263,6 +263,26 @@ void OIPComms::cleanup_tag_group(const String &tag_group_name) {
 
 	print("Cleaning up tags");
 
+	// Tear down any "One-Big-Tag" buffer handles tied to this group, then
+	// drop the entries from array_buffers_. discover_array_manifest will
+	// recreate them on next sim start. plc_tags is wiped below, so the
+	// PlcTag::read_buffer / write_buffer pointers go away with it.
+	{
+		const String key_prefix = tag_group_name + String("/");
+		for (auto it = array_buffers_.begin(); it != array_buffers_.end(); ) {
+			if (it->first.begins_with(key_prefix)) {
+				if (it->second.libplctag_handle >= 0) {
+					plc_tag_destroy(it->second.libplctag_handle);
+				}
+				it = array_buffers_.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+	manifest_state_.erase(tag_group_name);
+	manifest_bindings_.erase(tag_group_name);
+
 	if (tag_group.protocol == "opc_ua") {
 		for (auto &x : tag_group.opc_ua_tags) {
 			OpcUaTag &tag = x.second;
@@ -355,12 +375,11 @@ void OIPComms::process_work() {
 		if (sim_running) {
 			if (tag_groups.find(tag_group_name) != tag_groups.end()) {
 				process_tag_group(tag_group_name);
-			} else {
-				if (tag_group_name.is_empty()) {
-					print("Processing writes (no tag groups to be updated)");
-				} else {
-					if (!custom_instruction) print("Tag group not found: " + tag_group_name, true);
-				}
+			} else if (!tag_group_name.is_empty() && !custom_instruction) {
+				// Empty tag_group_name = a legacy write-queue wake-up; not
+				// an error, just flush_all_writes drained it above. Only
+				// log on real "group missing" cases.
+				print("Tag group not found: " + tag_group_name, true);
 			}
 		}
 	}
@@ -665,9 +684,42 @@ void OIPComms::process_tag_group(const String &tag_group_name) {
 
 void OIPComms::process_plc_tag_group(const String &tag_group_name) {
 	TagGroup &tag_group = tag_groups[tag_group_name];
+
+	// Drive "One-Big-Tag" buffers: one status check + read kick per buffer,
+	// regardless of how many logical LCI tags route through it. Read buffers
+	// flip initialized true the first time status reports OK. Write buffers
+	// were marked initialized at discovery time -- libplctag's
+	// auto_sync_write_ms drives the wire traffic; we just observe status.
+	{
+		const String key_prefix = tag_group_name + String("/");
+		for (auto &kv : array_buffers_) {
+			if (!kv.first.begins_with(key_prefix)) continue;
+			ArrayBuffer &ab = kv.second;
+			if (ab.libplctag_handle < 0) continue;
+			const int st = plc_tag_status(ab.libplctag_handle);
+			if (st == PLCTAG_STATUS_OK) {
+				ab.initialized = true;
+				if (!ab.is_write_direction) {
+					plc_tag_read(ab.libplctag_handle, 0);
+				}
+			} else if (st == PLCTAG_STATUS_PENDING) {
+				// In flight; libplctag will complete it. Don't pile on.
+			} else if (st < 0) {
+				plc_tag_abort(ab.libplctag_handle);
+				if (!ab.is_write_direction) {
+					plc_tag_read(ab.libplctag_handle, 0);
+				}
+			}
+		}
+	}
+
 	for (auto &x : tag_group.plc_tags) {
 		const String tag_name = x.first;
 		PlcTag &tag = x.second;
+
+		// Skip tags routed through a manifest buffer -- they don't have
+		// (and don't need) a per-tag libplctag handle.
+		if (tag.read_buffer != nullptr || tag.write_buffer != nullptr) continue;
 
 		if (tag.tag_pointer < 0) {
 			if (!init_plc_tag(tag_group_name, tag_name)) {
@@ -719,7 +771,10 @@ bool OIPComms::init_plc_tag(const String &tag_group_name, const String &tag_name
 	}
 	// failed to create tag
 	if (tag.tag_pointer < 0) {
-		print("Failed to create tag: " + tag_name, true);
+		const int status = tag.tag_pointer;
+		print("Failed to create tag: " + tag_name +
+			" (status=" + itos(status) + String(", ") +
+			String(plc_tag_decode_error(status)) + String(")"), true);
 		print("Skipping remainder of tag group: " + tag_group_name);
 		return false;
 	}
@@ -728,6 +783,193 @@ bool OIPComms::init_plc_tag(const String &tag_group_name, const String &tag_name
 	if (tag_group.protocol != "s7")
 		tag_group.init_count++;
 	return true;
+}
+
+// "One-Big-Tag" manifest discovery. See ArrayBuffer / PlcTag.read_buffer in
+// the header for the contract. Synchronous: called from set_sim_running(true)
+// on the GD main thread. Per-libplctag-call timeout capped at 3s, so the
+// worst-case stall at sim start with an unreachable controller is ~24s
+// (4 buffers * 2 calls each), typical case under 1s.
+//
+// For every PlcTag in the group whose name appears in one of the four
+// STRING manifest arrays, this attaches a slot pointer + index. The hot
+// path then dispatches that tag's reads/writes through the buffer instead
+// of creating a per-tag libplctag handle. Tags whose names DON'T appear
+// stay on the legacy path -- process_plc_tag_group still calls init_plc_tag
+// for them on the first sweep.
+void OIPComms::discover_array_manifest(const String &group_name) {
+	auto git = tag_groups.find(group_name);
+	if (git == tag_groups.end()) {
+		manifest_state_[group_name] = ManifestState::Failed;
+		return;
+	}
+	TagGroup &group = git->second;
+	if (group.protocol != "ab_eip") {
+		manifest_state_[group_name] = ManifestState::Done; // no-op for non-AB
+		return;
+	}
+
+	struct ManifestSpec {
+		const char *names_tag;
+		const char *data_tag;
+		bool is_write_direction;
+	};
+	const ManifestSpec specs[2] = {
+		{ "OIP_READ_NAMES",  "OIP_READ",  false },
+		{ "OIP_WRITE_NAMES", "OIP_WRITE", true  },
+	};
+
+	const String base_path = "protocol=ab_eip&gateway=" + group.gateway +
+		String("&path=") + group.path + String("&cpu=") + group.cpu +
+		String("&allow_packing=1&use_connected_msg=1");
+
+	// libplctag does NOT introspect array dimensions for AB EIP -- if we
+	// don't specify &elem_count it silently defaults to 1 and we'd only
+	// see the first slot. This is the contract: PLC programmer allocates
+	// every OIP_* manifest/data array as exactly this size. Walk stops at
+	// the first empty STRING, so unused tail slots cost nothing.
+	const int kManifestArraySize = 2000;
+	const String elem_count_attr = String("&elem_count=") + itos(kManifestArraySize);
+
+	int total_mapped = 0;
+	int buffers_created = 0;
+
+	for (const ManifestSpec &s : specs) {
+		// Phase 1: read the STRING manifest array.
+		const String names_path = base_path + String("&name=") + String(s.names_tag) + elem_count_attr;
+		int32_t names_handle = plc_tag_create(names_path.utf8().get_data(), 3000);
+		if (names_handle < 0) {
+			print(String("[manifest] ") + s.names_tag + String(" absent (") +
+				String(plc_tag_decode_error(names_handle)) +
+				String("); ") + s.data_tag + String("-bound tags will use legacy path"));
+			continue;
+		}
+		const int rc = plc_tag_read(names_handle, 3000);
+		if (rc != PLCTAG_STATUS_OK) {
+			print(String("[manifest] ") + s.names_tag + String(" read failed: ") +
+				String(plc_tag_decode_error(rc)));
+			plc_tag_destroy(names_handle);
+			continue;
+		}
+		const int names_elem_count = plc_tag_get_int_attribute(names_handle, "elem_count", 0);
+		const int names_total_size = plc_tag_get_size(names_handle);
+		if (names_elem_count <= 0 || names_total_size <= 0) {
+			print(String("[manifest] ") + s.names_tag + String(" zero size; skipping"));
+			plc_tag_destroy(names_handle);
+			continue;
+		}
+		const int per_elem = names_total_size / names_elem_count;
+		if (per_elem <= 0) {
+			print(String("[manifest] ") + s.names_tag + String(" unexpected per-element size"));
+			plc_tag_destroy(names_handle);
+			continue;
+		}
+
+		std::map<String, int32_t> name_to_slot;
+		for (int i = 0; i < names_elem_count; ++i) {
+			const int off = i * per_elem;
+			const int len = plc_tag_get_string_length(names_handle, off);
+			if (len <= 0) break; // empty STRING terminates the list
+			std::vector<char> buf((size_t)len + 1, 0);
+			const int rc2 = plc_tag_get_string(names_handle, off, buf.data(), (int)buf.size());
+			if (rc2 != PLCTAG_STATUS_OK) break;
+			String name = String::utf8(buf.data());
+			if (name.is_empty()) break;
+			name_to_slot.emplace(name, i);
+		}
+		plc_tag_destroy(names_handle); // names array isn't needed after parse
+
+		if (name_to_slot.empty()) {
+			print(String("[manifest] ") + s.names_tag + String(" is empty"));
+			continue;
+		}
+
+		// Phase 2: create the long-lived data buffer handle.
+		// Read buffers are driven by process_plc_tag_group's per-sweep
+		// plc_tag_read kick. Write buffers use auto_sync_write_ms so
+		// inline write_X calls land on the wire without our help.
+		String data_path = base_path + String("&name=") + String(s.data_tag) + elem_count_attr;
+		if (s.is_write_direction) data_path += String("&auto_sync_write_ms=50");
+		int32_t data_handle = plc_tag_create(data_path.utf8().get_data(), 3000);
+		if (data_handle < 0) {
+			print(String("[manifest] ") + s.data_tag + String(" create failed: ") +
+				String(plc_tag_decode_error(data_handle)));
+			continue;
+		}
+
+		const String key = group_name + String("/") + String(s.data_tag);
+		ArrayBuffer &ab = array_buffers_[key];
+		ab.libplctag_handle = data_handle;
+		ab.elem_count = plc_tag_get_int_attribute(data_handle, "elem_count",
+			(int32_t)name_to_slot.size());
+		ab.is_write_direction = s.is_write_direction;
+		// Write buffers are usable for plc_tag_set_* immediately. Read
+		// buffers flip true after the first OK read in process_plc_tag_group.
+		ab.initialized = s.is_write_direction;
+		buffers_created++;
+
+		// Phase 3a: cache the name->buffer binding so register_tag can wire
+		// LCI tags that register AFTER this discovery runs.
+		auto &group_bindings = manifest_bindings_[group_name];
+		for (const auto &nti : name_to_slot) {
+			ManifestBinding &b = group_bindings[nti.first];
+			if (s.is_write_direction) {
+				b.write_buffer = &ab;
+				b.write_slot = nti.second;
+			} else {
+				b.read_buffer = &ab;
+				b.read_slot = nti.second;
+			}
+		}
+
+		// Phase 3b: apply to any PlcTags already registered (early arrivals).
+		// Late arrivals get bound in register_tag via the cached bindings.
+		int mapped = 0;
+		for (auto &plc_pair : group.plc_tags) {
+			const String &tag_name = plc_pair.first;
+			PlcTag &tag = plc_pair.second;
+			auto nti = name_to_slot.find(tag_name);
+			if (nti == name_to_slot.end()) continue;
+			if (s.is_write_direction) {
+				if (tag.write_buffer == nullptr) {
+					tag.write_buffer = &ab;
+					tag.write_slot = nti->second;
+					mapped++;
+				}
+			} else {
+				if (tag.read_buffer == nullptr) {
+					tag.read_buffer = &ab;
+					tag.read_slot = nti->second;
+					mapped++;
+				}
+			}
+			// Count this PlcTag as initialized for tag_group_initialized
+			// purposes. The signal otherwise waits forever because
+			// init_plc_tag is never called for manifest-covered tags.
+			// Use tag.initialized as the dedup guard so bidir (mapped in
+			// both directions) doesn't double-count.
+			if (!tag.initialized) {
+				tag.initialized = true;
+				group.init_count++;
+			}
+		}
+
+		total_mapped += mapped;
+		print(String("[manifest] ") + s.data_tag + String(": ") + itos(mapped) + String("/") +
+			itos((int)name_to_slot.size()) + String(" names linked (more bind on registration)"));
+	}
+
+	int unmapped = 0;
+	for (const auto &plc_pair : group.plc_tags) {
+		const PlcTag &t = plc_pair.second;
+		if (t.read_buffer == nullptr && t.write_buffer == nullptr) unmapped++;
+	}
+
+	print(String("[manifest] ") + group_name + String(" discovery: ") +
+		itos(buffers_created) + String(" buffer(s), ") +
+		itos(total_mapped) + String(" mapped, ") +
+		itos(unmapped) + String(" unmapped"));
+	manifest_state_[group_name] = ManifestState::Done;
 }
 
 void OIPComms::process_opc_ua_tag_group(const String &tag_group_name) {
@@ -1446,7 +1688,25 @@ void OIPComms::process() {
 				if (tag_group.init_count >= total_tag_count) {
 					if (first_init_pending) {
 						emit_signal("tag_group_initialized", tag_group_name);
-						print("Tag group initialized: " + tag_group_name);
+						// Surface how many of the freshly-initialized tags are
+						// manifest-routed vs legacy so the perf win is visible
+						// without a GDScript probe.
+						int bound = 0;
+						int legacy = 0;
+						if (tag_group.protocol == "ab_eip") {
+							for (const auto &px : tag_group.plc_tags) {
+								if (px.second.read_buffer != nullptr || px.second.write_buffer != nullptr) {
+									bound++;
+								} else {
+									legacy++;
+								}
+							}
+							print("Tag group initialized: " + tag_group_name +
+								" (" + itos((int64_t)bound) + " manifest-bound, " +
+								itos((int64_t)legacy) + " legacy)");
+						} else {
+							print("Tag group initialized: " + tag_group_name);
+						}
 						tag_group.init_count_emitted = true;
 					}
 					if (recovery_pending) {
@@ -1657,8 +1917,35 @@ bool OIPComms::register_tag(const String p_tag_group_name, const String p_tag_na
 				}
 				PlcTag tag = { false, -1, elem_count, false };
 				tag_group.plc_tags[p_tag_name] = tag;
+
+				// "One-Big-Tag" manifest binding: if discover_array_manifest
+				// already ran and saw this tag's name, wire it up now. This
+				// is the common path -- LCI fires register_tag on the
+				// simulation_started signal, AFTER set_sim_running(true) and
+				// therefore AFTER discovery has cached bindings for this group.
+				auto bit = manifest_bindings_.find(p_tag_group_name);
+				if (bit != manifest_bindings_.end()) {
+					auto nit = bit->second.find(p_tag_name);
+					if (nit != bit->second.end()) {
+						PlcTag &fresh = tag_group.plc_tags[p_tag_name];
+						const ManifestBinding &b = nit->second;
+						if (b.read_buffer != nullptr) {
+							fresh.read_buffer = b.read_buffer;
+							fresh.read_slot = b.read_slot;
+						}
+						if (b.write_buffer != nullptr) {
+							fresh.write_buffer = b.write_buffer;
+							fresh.write_slot = b.write_slot;
+						}
+						// Count as initialized for tag_group_initialized,
+						// matching the early-arrival path in discover.
+						if (!fresh.initialized) {
+							fresh.initialized = true;
+							tag_group.init_count++;
+						}
+					}
+				}
 			}
-			print("Registered tag " + p_tag_name + " under tag group " + p_tag_group_name);
 		}
 
 		return true;
@@ -1686,6 +1973,19 @@ void OIPComms::set_sim_running(bool value) {
 	if (value) {
 		comms_error = false;
 		print("Sim running");
+
+		// "One-Big-Tag" manifest discovery: for every ab_eip group, read
+		// OIP_*_NAMES STRING arrays from the controller and wire each
+		// registered PlcTag to its slot in the matching REAL/DINT buffer.
+		// Synchronous so any plc_tag_create that follows already sees the
+		// buffer routing set. Manifest absence (programmer hasn't built it
+		// yet) is fine -- tags transparently fall back to the legacy path.
+		manifest_state_.clear();
+		for (const auto &gx : tag_groups) {
+			if (gx.second.protocol == "ab_eip") {
+				discover_array_manifest(gx.first);
+			}
+		}
 	} else {
 		print("Sim stopped");
 
@@ -2087,7 +2387,13 @@ Dictionary OIPComms::browse_node_info(const String p_node_id) {
 				} else { return 0.0; }                                            \
 			}                                                                     \
 			else {                                                                \
-				PlcTag tag = tag_group.plc_tags[p_tag_name];                      \
+				PlcTag &tag = tag_group.plc_tags[p_tag_name];                     \
+				/* Manifest hot path: tag's value lives in a slot of a big */     \
+				/* REAL[N] / DINT[N] buffer the worker reads once per sweep.*/    \
+				if (tag.read_buffer != nullptr) {                                 \
+					if (!tag.read_buffer->initialized) return 0;                  \
+					return (b)array_buffer_read<b>(*tag.read_buffer, tag.read_slot); \
+				}                                                                 \
 				if (tag.initialized) {                                            \
 					int32_t tag_pointer = tag.tag_pointer;                        \
 					return plc_tag_get_##a(tag_pointer, 0);                       \
@@ -2112,6 +2418,17 @@ OIP_READ_FUNC(float32, float, FLOAT)
 #define OIP_WRITE_FUNC(a, b, c)                                                                                                         \
 	void OIPComms::write_##a(const String p_tag_group_name, const String p_tag_name, const b p_value) {                                 \
 		if (enable_comms && sim_running && tag_exists(p_tag_group_name, p_tag_name)) {                                                  \
+			TagGroup &tag_group = tag_groups[p_tag_group_name];                                                                         \
+			/* Manifest hot path: write straight into the buffer's libplctag cache.   */                                                \
+			/* auto_sync_write_ms on the buffer tag pushes the change to the PLC      */                                                \
+			/* without our worker round-trip. Bypasses the queue entirely.            */                                                \
+			if (tag_group.protocol == "ab_eip") {                                                                                       \
+				PlcTag &tag = tag_group.plc_tags[p_tag_name];                                                                           \
+				if (tag.write_buffer != nullptr) {                                                                                      \
+					array_buffer_write<b>(*tag.write_buffer, tag.write_slot, p_value);                                                  \
+					return;                                                                                                             \
+				}                                                                                                                       \
+			}                                                                                                                           \
 			WriteRequest write_req = {                                                                                                  \
 				c,                                                                                                                      \
 				p_tag_group_name,                                                                                                       \

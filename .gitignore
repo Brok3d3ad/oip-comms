@@ -55,6 +55,17 @@ demo/bin/windows/*.dll
 # Other stuff
 *.log
 
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env/
+pyvenv.cfg
+__pycache__/
+*.egg-info/
+*.egg
+
 # VSCode
 .vscode/*
 !.vscode/extensions.json

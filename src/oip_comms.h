@@ -25,11 +25,14 @@ class OIPComms : public Node {
 	GDCLASS(OIPComms, Node)
 
 private:
-	int timeout = 5000;
+	int timeout = 15000;
 	double startup_timer = 0.0f;
 	double register_wait_time = 500.0f;
 	bool comms_error = false;
 	String last_error = "";
+
+	// Forward declaration so PlcTag can reference it.
+	struct ArrayBuffer;
 
 	struct PlcTag {
 		bool initialized = false;
@@ -40,6 +43,18 @@ private:
 		// TBD - in the future expose an API so that "immediate reads" can occur
 		// a little tricky with the current blocking queue/thread implementation
 		bool dirty;
+
+		// "One-Big-Tag" manifest routing. When a tag's name is found in
+		// OIP_READ_NAMES / OIP_WRITE_NAMES / OIP_READ_DINT_NAMES /
+		// OIP_WRITE_DINT_NAMES on the controller, discover_array_manifest
+		// points read_buffer/write_buffer at the corresponding REAL[N] or
+		// DINT[N] data tag and stores the slot index. The hot path then
+		// dispatches that read/write directly into the buffer's libplctag
+		// cache, skipping the per-tag libplctag handle entirely.
+		ArrayBuffer *read_buffer = nullptr;
+		int32_t read_slot = 0;
+		ArrayBuffer *write_buffer = nullptr;
+		int32_t write_slot = 0;
 	};
 
 	struct OpcUaTag {
@@ -89,6 +104,74 @@ private:
 	};
 	std::map<String, TagGroup> tag_groups;
 	std::vector<String> tag_group_order;
+
+	// "One-Big-Tag" manifest. PLC programmer publishes two controller-scope
+	// REAL[N] buffers + parallel STRING[N] manifests per group:
+	//
+	//   OIP_READ_NAMES   STRING[N_R]   one tag name per slot
+	//   OIP_READ         REAL[N_R]     PLC ladder COP/MOVs into here every scan
+	//   OIP_WRITE_NAMES  STRING[N_W]   one tag name per slot
+	//   OIP_WRITE        REAL[N_W]     ladder COP/MOVs from here every scan
+	//
+	// All-REAL routing: integer-typed tags (DINT/INT/SINT in the source
+	// data) share the REAL buffer with floats and bools. Logix5000's
+	// implicit REAL<->DINT coercion on assignment preserves values within
+	// +/-2^24 (16.7M) -- safe for fault codes (<=0x00FFFFFF) and bitmasks.
+	//
+	// On sim start, discover_array_manifest reads the NAMES arrays, builds a
+	// per-group slot map, creates ONE libplctag handle per data buffer
+	// (2 buffers per group, not N), and attaches each registered PlcTag to
+	// its slot. Wire traffic collapses from N per-tag CIP reads/sweep to
+	// 2 array reads/sweep regardless of N.
+	struct ArrayBuffer {
+		int32_t libplctag_handle = -1;
+		int elem_count = 0;
+		bool is_write_direction = false; // false = OIP_READ, true = OIP_WRITE
+		bool initialized = false;        // read buffer: first OK; write: at create
+	};
+	// Keyed by "<group_name>/<buffer_name>" with buffer_name in
+	// {OIP_READ, OIP_READ_DINT, OIP_WRITE, OIP_WRITE_DINT}. Pointers cached
+	// in PlcTag.read_buffer / write_buffer stay valid because std::map
+	// insertions don't invalidate pointers and we only erase on cleanup.
+	std::map<String, ArrayBuffer> array_buffers_;
+
+	// Per-group discovery state. Reset on sim restart so the manifest is
+	// re-read if the programmer changed it between runs.
+	enum class ManifestState : uint8_t { NotStarted, Done, Failed };
+	std::map<String, ManifestState> manifest_state_;
+
+	// Cached manifest bindings, keyed by group_name -> tag_name. Populated
+	// by discover_array_manifest from the OIP_*_NAMES STRING arrays. Used
+	// by register_tag to wire late-registered PlcTags to their slot --
+	// LCI typically calls register_tag AFTER set_sim_running(true), so the
+	// existing-plc_tags walk in discover misses them and we need a lookup
+	// the registration path can consult.
+	struct ManifestBinding {
+		ArrayBuffer *read_buffer = nullptr;
+		int32_t read_slot = 0;
+		ArrayBuffer *write_buffer = nullptr;
+		int32_t write_slot = 0;
+	};
+	std::map<String, std::map<String, ManifestBinding>> manifest_bindings_;
+
+	void discover_array_manifest(const String &group_name);
+
+	// Hot-path dispatch helpers. The OIP_READ_FUNC / OIP_WRITE_FUNC macros
+	// call into these when a PlcTag has read_buffer / write_buffer set.
+	// One buffer slot is sizeof(REAL) = 4 bytes. (T)float reading != 0
+	// gives the right truthiness for bool, so no specialisation is needed.
+	template <typename T>
+	static T array_buffer_read(const ArrayBuffer &ab, int32_t slot) {
+		return (T)plc_tag_get_float32(ab.libplctag_handle, slot * 4);
+	}
+	template <typename T>
+	static void array_buffer_write(ArrayBuffer &ab, int32_t slot, T value) {
+		const int byte_off = slot * 4;
+		const float newv = (float)value;
+		const float cached = plc_tag_get_float32(ab.libplctag_handle, byte_off);
+		if (cached == newv) return; // dedup; auto_sync_write_ms flushes on change
+		plc_tag_set_float32(ab.libplctag_handle, byte_off, newv);
+	}
 
 	struct WriteRequest {
 		uint8_t instruction;
