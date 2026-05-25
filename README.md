@@ -61,7 +61,7 @@ After cloning, fetch the submodules (`godot-cpp` and `ads`):
 Build command:
 `scons platform=windows debug_symbols=yes`
 
-The output of building will be the DLLs located in: https://github.com/bikemurt/OIP_gdext/tree/main/demo/bin/windows
+The output of building will be the DLLs located in: https://github.com/Open-Industry-Project/oip-comms/tree/main/demo/bin/windows
 
 The DLLs, and `oip_comms.gdextension` file must be copied to the `oip_comms` dock plugin for the main Open Industry Project repo: `Open-Industry-Project/addons/oip_comms/bin/`. Right now just building for Windows, but should be extendable to other platforms.
 
