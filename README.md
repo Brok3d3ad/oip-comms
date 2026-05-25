@@ -73,7 +73,7 @@ This project uses the standard library.
 
 # Documentation
 
-Update https://github.com/bikemurt/OIP_gdext/blob/main/doc_classes/OIPComms.xml as required and rebuild.
+Update https://github.com/Open-Industry-Project/oip-comms/blob/main/doc_classes/OIPComms.xml as required and rebuild.
 
 # Debugging
 As long as you build with `debug_symbols=yes`, the 4.5 branch of OIP will be able to debug this GDextension application. 
