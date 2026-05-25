@@ -18,6 +18,19 @@ The Beckhoff ADS library has two variants and the build picks one per platform:
 - **Windows**: links against the locally-installed `TcAdsDll.dll` (Beckhoff's official client) via the `USE_TWINCAT_ROUTER` define. Required because TwinCAT 3 build 4026 enforces Secure ADS, and the standalone library only speaks plain TCP — its requests are silently dropped by 4026's runtime. Requires TwinCAT to be installed locally; the GDExtension delay-loads `TcAdsDll.dll` at runtime, resolving the install path from the Windows registry (see [src/tcads_loader.cpp](src/tcads_loader.cpp)). The DLL itself is **not** redistributed with this project.
 - **Linux / macOS**: uses the standalone library (its own AmsRouter, plain TCP). This is the standalone lib's documented use case — connecting from a non-TwinCAT host to a remote TwinCAT system. A route entry must be configured on the remote TwinCAT for the local AmsNetId.
 
+## Modbus specifics
+As mentioned above, modbus TCP communications are achieved through the `libtagplc` library. It is generally well behaved but the only potential hiccup is dealing with FLOAT32 data types. `libtagplc` uses `3210`, big-endian byte order (see [here](https://github.com/libplctag/libplctag/wiki/Tag-String-Attributes#optional-generic-byte-order-attributes)).
+
+Inside The Open Industry Project, make sure you set the `elem_count` parameter to `2` for this case (1 for all others). This will transmit 2 16-bit words.
+
+`OIPComms.register_tag(tag_group_name, tag_name, elem_count=2)`
+
+This calculator can be used to help confirm your data type and endian-ness: https://modbuskit.com/en/data-converter
+
+Other tools that can help modbus debugging:
+- [ModbusPal](https://modbuspal.sourceforge.net/): this acts as a modbus simulator, generating modbus data
+- [QModMaster](https://sourceforge.net/projects/qmodmaster/): this acts as a modbus client, reading data from ModbusPal
+
 ## RTDE specifics
 The RTDE backend talks to Universal Robots controllers (real hardware or URSim) on TCP port 30004 using protocol version 2. The full variable vocabulary is documented in the [official UR RTDE guide](https://docs.universal-robots.com/tutorials/communication-protocol-tutorials/rtde-guide.html). Tag-group fields:
 - **Gateway**: robot IP address (e.g. `192.168.56.101`).
