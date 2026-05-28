@@ -1480,7 +1480,7 @@ void OIPComms::print(const Variant &message, bool error) {
 
 void OIPComms::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("register_tag_group", "tag_group_name", "polling_interval", "protocol", "gateway", "path", "cpu"), &OIPComms::register_tag_group);
-	ClassDB::bind_method(D_METHOD("register_tag", "tag_group_name", "tag_name", "elem_count"), &OIPComms::register_tag);
+	ClassDB::bind_method(D_METHOD("register_tag", "tag_group_name", "tag_name", "data_type"), &OIPComms::register_tag, DEFVAL(TAG_TYPE_BOOL));
 
 	ClassDB::bind_method(D_METHOD("set_enable_comms", "value"), &OIPComms::set_enable_comms);
 	ClassDB::bind_method(D_METHOD("get_enable_comms"), &OIPComms::get_enable_comms);
@@ -1533,6 +1533,18 @@ void OIPComms::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("comms_error"));
 	ADD_SIGNAL(MethodInfo("tag_groups_registered"));
 	ADD_SIGNAL(MethodInfo("enable_comms_changed"));
+
+	BIND_ENUM_CONSTANT(TAG_TYPE_BOOL);
+	BIND_ENUM_CONSTANT(TAG_TYPE_INT8);
+	BIND_ENUM_CONSTANT(TAG_TYPE_UINT8);
+	BIND_ENUM_CONSTANT(TAG_TYPE_INT16);
+	BIND_ENUM_CONSTANT(TAG_TYPE_UINT16);
+	BIND_ENUM_CONSTANT(TAG_TYPE_INT32);
+	BIND_ENUM_CONSTANT(TAG_TYPE_UINT32);
+	BIND_ENUM_CONSTANT(TAG_TYPE_INT64);
+	BIND_ENUM_CONSTANT(TAG_TYPE_UINT64);
+	BIND_ENUM_CONSTANT(TAG_TYPE_FLOAT32);
+	BIND_ENUM_CONSTANT(TAG_TYPE_FLOAT64);
 }
 
 void OIPComms::register_tag_group(const String p_tag_group_name, const int p_polling_interval, const String p_protocol, const String p_gateway, const String p_path, const String p_cpu) {
@@ -1578,7 +1590,7 @@ void OIPComms::register_tag_group(const String p_tag_group_name, const int p_pol
 	print("Tag group registered: " + p_tag_group_name);
 }
 
-bool OIPComms::register_tag(const String p_tag_group_name, const String p_tag_name, const int p_elem_count) {
+bool OIPComms::register_tag(const String p_tag_group_name, const String p_tag_name, const int p_data_type) {
 	if (p_tag_group_name.is_empty() || p_tag_name.is_empty())
 		return false;
 
@@ -1618,7 +1630,25 @@ bool OIPComms::register_tag(const String p_tag_group_name, const String p_tag_na
 					tag_group.mqtt_impl = new MqttTagGroupImpl();
 				tag_group.mqtt_impl->tags[p_tag_name];
 			} else {
-				PlcTag tag = { false, -1, p_elem_count, false };
+				int elem_count = 1;
+				if (tag_group.protocol == "modbus_tcp") {
+					switch (p_data_type) {
+						case TAG_TYPE_INT32:
+						case TAG_TYPE_UINT32:
+						case TAG_TYPE_FLOAT32:
+							elem_count = 2;
+							break;
+						case TAG_TYPE_INT64:
+						case TAG_TYPE_UINT64:
+						case TAG_TYPE_FLOAT64:
+							elem_count = 4;
+							break;
+						default:
+							elem_count = 1;
+							break;
+					}
+				}
+				PlcTag tag = { false, -1, elem_count, false };
 				tag_group.plc_tags[p_tag_name] = tag;
 			}
 			print("Registered tag " + p_tag_name + " under tag group " + p_tag_group_name);

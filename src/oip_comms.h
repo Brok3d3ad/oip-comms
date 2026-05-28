@@ -7,6 +7,7 @@
 
 #include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/classes/thread.hpp>
+#include <godot_cpp/core/binder_common.hpp>
 #include <map>
 #include <string>
 #include <vector>
@@ -217,8 +218,22 @@ protected:
 	static void _bind_methods();
 
 public:
+	enum TagType {
+		TAG_TYPE_BOOL,
+		TAG_TYPE_INT8,
+		TAG_TYPE_UINT8,
+		TAG_TYPE_INT16,
+		TAG_TYPE_UINT16,
+		TAG_TYPE_INT32,
+		TAG_TYPE_UINT32,
+		TAG_TYPE_INT64,
+		TAG_TYPE_UINT64,
+		TAG_TYPE_FLOAT32,
+		TAG_TYPE_FLOAT64,
+	};
+
 	void register_tag_group(const String p_tag_group_name, const int p_polling_interval, const String p_protocol, const String p_gateway, const String p_path, const String p_cpu);
-	bool register_tag(const String p_tag_group_name, const String p_tag_name, const int p_elem_count);
+	bool register_tag(const String p_tag_group_name, const String p_tag_name, const int p_data_type);
 
 	bool get_enable_comms();
 	void set_enable_comms(bool value);
@@ -263,5 +278,7 @@ public:
 };
 
 } //namespace godot
+
+VARIANT_ENUM_CAST(godot::OIPComms::TagType);
 
 #endif

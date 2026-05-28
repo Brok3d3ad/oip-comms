@@ -19,11 +19,13 @@ The Beckhoff ADS library has two variants and the build picks one per platform:
 - **Linux / macOS**: uses the standalone library (its own AmsRouter, plain TCP). This is the standalone lib's documented use case — connecting from a non-TwinCAT host to a remote TwinCAT system. A route entry must be configured on the remote TwinCAT for the local AmsNetId.
 
 ## Modbus specifics
-As mentioned above, modbus TCP communications are achieved through the `libtagplc` library. It is generally well behaved but the only potential hiccup is dealing with FLOAT32 data types. `libtagplc` uses `3210`, big-endian byte order (see [here](https://github.com/libplctag/libplctag/wiki/Tag-String-Attributes#optional-generic-byte-order-attributes)).
+As mentioned above, modbus TCP communications are achieved through the `libtagplc` library. It is generally well behaved but the only potential hiccup is dealing with multi-register data types like FLOAT32. `libtagplc` uses `3210`, big-endian byte order (see [here](https://github.com/libplctag/libplctag/wiki/Tag-String-Attributes#optional-generic-byte-order-attributes)).
 
-Inside The Open Industry Project, make sure you set the `elem_count` parameter to `2` for this case (1 for all others). This will transmit 2 16-bit words.
+A modbus "element" is a single 16-bit register, so any value wider than 16 bits spans multiple registers. You declare the value's type when registering the tag and `OIPComms` sizes the register span for you:
 
-`OIPComms.register_tag(tag_group_name, tag_name, elem_count=2)`
+`OIPComms.register_tag(tag_group_name, tag_name, OIPComms.TAG_TYPE_FLOAT32)`
+
+The `data_type` argument (one of the `TAG_TYPE_*` constants) is only consulted for `modbus_tcp`; FLOAT32/INT32/UINT32 occupy two registers, FLOAT64/INT64/UINT64 occupy four, and everything else is one. For all other protocols the type is inferred from the `read_*`/`write_*` method you call and `data_type` is ignored (it defaults to `TAG_TYPE_BOOL`).
 
 This calculator can be used to help confirm your data type and endian-ness: https://modbuskit.com/en/data-converter
 

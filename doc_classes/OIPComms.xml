@@ -149,7 +149,7 @@
 			<return type="bool" />
 			<param index="0" name="tag_group_name" type="String" />
 			<param index="1" name="tag_name" type="String" />
-			<param index="2" name="elem_count" type="int" />
+			<param index="2" name="data_type" type="int" enum="OIPComms.TagType" default="0" />
 			<description>
 			Register a tag to a [code]tag_group_name[/code]. The tag group must be registered prior to registering the tag.
 			The format of [code]tag_name[/code] depends on the protocol of the tag group:
@@ -159,7 +159,7 @@
 			[b]Beckhoff ADS ([code]ads[/code]):[/b] A symbol path as it appears in the TwinCAT runtime, e.g. [code]MAIN.fbMotor.bRunning[/code] or [code]GVL_IO.iCounter[/code]. Only scalar primitive types (BOOL, BYTE/SINT/USINT, INT/UINT, DINT/UDINT, LINT/ULINT, REAL, LREAL) are supported.
 			[b]Universal Robots RTDE ([code]rtde[/code]):[/b] A variable name from UR's RTDE vocabulary, e.g. [code]actual_q[0][/code], [code]runtime_state[/code], [code]input_int_register_0[/code]. Vector fields use [code]name[index][/code] syntax. Names beginning with [code]input_[/code] are routed to the input recipe and are writable; everything else is read-only.
 			[b]MQTT ([code]mqtt[/code]):[/b] The MQTT topic that this tag subscribes to and publishes on, e.g. [code]sensors/temp1[/code] or [code]factory/line_a/state[/code]. The broker payload is interpreted as a raw little-endian scalar matching whichever [code]read_*[/code]/[code]write_*[/code] API is used. Wildcards ([code]+[/code], [code]#[/code]) are not supported.
-			[i]Note: [code]elem_count[/code] is not currently implemented. This will be future work if array reads/writes are needed.[/i]
+			[code]data_type[/code] declares the logical type of the value (one of the [code]TAG_TYPE_*[/code] constants). It is only consulted for the [code]modbus_tcp[/code] protocol, where it determines how many 16-bit registers the value spans (e.g. a [code]TAG_TYPE_FLOAT32[/code] occupies two registers). For every other protocol the type is inferred from whichever [code]read_*[/code]/[code]write_*[/code] method is used and [code]data_type[/code] is ignored.
 			</description>
 		</method>
 		<method name="register_tag_group">
@@ -368,4 +368,39 @@
 			</description>
 		</signal>
 	</signals>
+	<constants>
+		<constant name="TAG_TYPE_BOOL" value="0" enum="TagType">
+			Boolean value. On modbus this maps to a single coil/discrete or register.
+		</constant>
+		<constant name="TAG_TYPE_INT8" value="1" enum="TagType">
+			8-bit signed integer (one modbus register).
+		</constant>
+		<constant name="TAG_TYPE_UINT8" value="2" enum="TagType">
+			8-bit unsigned integer (one modbus register).
+		</constant>
+		<constant name="TAG_TYPE_INT16" value="3" enum="TagType">
+			16-bit signed integer (one modbus register).
+		</constant>
+		<constant name="TAG_TYPE_UINT16" value="4" enum="TagType">
+			16-bit unsigned integer (one modbus register).
+		</constant>
+		<constant name="TAG_TYPE_INT32" value="5" enum="TagType">
+			32-bit signed integer (two modbus registers).
+		</constant>
+		<constant name="TAG_TYPE_UINT32" value="6" enum="TagType">
+			32-bit unsigned integer (two modbus registers).
+		</constant>
+		<constant name="TAG_TYPE_INT64" value="7" enum="TagType">
+			64-bit signed integer (four modbus registers).
+		</constant>
+		<constant name="TAG_TYPE_UINT64" value="8" enum="TagType">
+			64-bit unsigned integer (four modbus registers).
+		</constant>
+		<constant name="TAG_TYPE_FLOAT32" value="9" enum="TagType">
+			32-bit IEEE 754 float (two modbus registers).
+		</constant>
+		<constant name="TAG_TYPE_FLOAT64" value="10" enum="TagType">
+			64-bit IEEE 754 float (four modbus registers).
+		</constant>
+	</constants>
 </class>
