@@ -76,6 +76,9 @@ public:
     S7MemoryBlock* Mem;
     int Identifier; // 0 to 0xFFFFFF
 
+    uint64_t PendingValue;
+    bool WritePending;
+
     S7Tag()
     {
         Identifier = IdCounter++;
@@ -84,6 +87,8 @@ public:
         BitIdx = -1;
         ByteQty = 0;
         Mem = nullptr;
+        PendingValue = 0;
+        WritePending = false;
     }
 };
 int S7Tag::IdCounter = 0;
@@ -112,6 +117,8 @@ class S7Plc {
 public:
     uint8_t Identifier;
     std::string PlcHostName;
+
+    bool S7_isConnected() { return state == 2; }
 
     S7Plc(const std::string& host, int rate = 10) : PlcHostName(host), pollingRate(rate) 
     {
@@ -351,9 +358,17 @@ public:
         delete tag;
         return ret;
     }
-    int S7_write(const S7Tag& tag, uint64_t Value) 
+    int S7_write(S7Tag& tag, uint64_t Value) // caches only; S7_sendTag transmits
     {
-        if (state != 2 || !tag.Mem) return -1;
+        tag.PendingValue = Value;
+        tag.WritePending = true;
+        return 0;
+    }
+    // 0 = delivered, 1 = still pending (retry later), -1 = PLC rejected (give up).
+    int S7_sendTag(S7Tag& tag)
+    {
+        if (!tag.WritePending) return 0;
+        if (state != 2 || !tag.Mem) return 1;
         lockObj.lock();// Tcp socket & Buffer are shared, beware of concurrency issues
         memcpy(Buff, Write_IQM_Bytes, sizeof(Write_IQM_Bytes));
         Buff[3] = (uint8_t)(sizeof(Write_IQM_Bytes) + tag.ByteQty);
@@ -376,13 +391,31 @@ public:
         }
         // S7 are Big - Endian
         uint8_t ValueBytes[8];
-        for (int i = 0; i < 8; ++i) ValueBytes[i] = (Value >> (8 * (7 - i))) & 0xFF;
+        for (int i = 0; i < 8; ++i) ValueBytes[i] = (tag.PendingValue >> (8 * (7 - i))) & 0xFF;
 
         memcpy(Buff + 35, ValueBytes + (8 - tag.ByteQty), tag.ByteQty);
         int ret = S7_TcpExchange(Buff, sizeof(Write_IQM_Bytes) + tag.ByteQty);
         uint8_t ErrorCode = Buff[21];
         lockObj.unlock();
-        if (ret == 22 && ErrorCode == 0xFF) return 0; else return -1;
+        if (ret == 22 && ErrorCode == 0xFF) { tag.WritePending = false; return 0; }
+        if (ret == 22) { tag.WritePending = false; return -1; } // got a response but rejected
+        return 1; // transport dropped, not a rejection: retry after reconnect
+    }
+    int SendTagById(int identifier)
+    {
+        for (auto& tag : Tags)
+            if (tag->Identifier == (identifier & 0xFFFFFF))
+                return S7_sendTag(*tag);
+        return -1;
+    }
+
+    int FlushPendingWrites()
+    {
+        int delivered = 0;
+        for (auto& tag : Tags)
+            if (tag->WritePending && S7_sendTag(*tag) == 0)
+                delivered++;
+        return delivered;
     }
 
     uint64_t S7_read(int identifier) {
@@ -502,19 +535,25 @@ int S7_tag_destroy(int identifier)
 
 int S7_tag_write(int identifier)
 {
-    // Write already done with set.
     for (auto plc : S7Plcs) {
         if (plc->Identifier == (identifier >> 24))
-            return 0;
+            return plc->SendTagById(identifier);
     }
-     return -1;
+    return -1;
 }
-int S7_tag_read(int identifier, int timeout)
+int S7_tag_connected(int identifier)
 {
-    // Only verify that the PLC is configured for the tag
     for (auto plc : S7Plcs) {
         if (plc->Identifier == (identifier >> 24))
-            return 0;
+            return plc->S7_isConnected() ? 1 : 0;
+    }
+    return 0;
+}
+int S7_tag_flush(int identifier)
+{
+    for (auto plc : S7Plcs) {
+        if (plc->Identifier == (identifier >> 24))
+            return plc->FlushPendingWrites();
     }
     return -1;
 }

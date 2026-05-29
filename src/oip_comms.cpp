@@ -625,12 +625,14 @@ void OIPComms::process_write(const WriteRequest &write_req) {
 	if (tag_group.protocol != "opc_ua" && tag_group.protocol != "ads"
 			&& tag_group.protocol != "rtde" && tag_group.protocol != "mqtt") {
 		if (tag_group.protocol == "s7"){
-			if (tag_pointer >= 0 && S7_tag_write(tag_pointer) == PLCTAG_STATUS_OK) {
+			int s7_status = (tag_pointer >= 0) ? S7_tag_write(tag_pointer) : -1;
+			if (s7_status == 0) {
 				tag_groups[write_req.tag_group_name].plc_tags[write_req.tag_name].dirty = true;
 				print("Write tag done: " + write_req.tag_name);
+			} else if (s7_status > 0) {
+				print("Write deferred, PLC link not ready, will retry: " + write_req.tag_name);
 			} else {
 				print("Failed to write tag: " + write_req.tag_name, true);
-				print("Write tag done: " + write_req.tag_name);
 			}
 		}
 		else {
@@ -676,17 +678,13 @@ void OIPComms::process_plc_tag_group(const String &tag_group_name) {
 		}
 		if (tag_group.protocol == "s7")
 		{
-			int read_result = S7_tag_read(tag.tag_pointer, timeout);
-			if (read_result == PLCTAG_STATUS_OK) {
+			if (S7_tag_connected(tag.tag_pointer)) {
 				tag.dirty = false;
-				tag.initialized = true;
+				if (!tag.initialized) {
+					tag.initialized = true;
+					tag_group.init_count++;
+				}
 			}
-			else
-			{
-				tag_group.has_error = true;
-				return;
-			}
-
 		} else
 		if (tag.tag_pointer >= 0) {
 			if (!process_plc_read(tag, tag_name)) {
@@ -696,6 +694,13 @@ void OIPComms::process_plc_tag_group(const String &tag_group_name) {
 				tag.dirty = false;
 			}
 		}
+	}
+
+	if (tag_group.protocol == "s7" && !tag_group.plc_tags.empty()) {
+		// any tag works: one gateway per group means one PLC
+		int flushed = S7_tag_flush(tag_group.plc_tags.begin()->second.tag_pointer);
+		if (flushed > 0)
+			print("Delivered " + itos(flushed) + " deferred write(s) for tag group: " + tag_group_name);
 	}
 }
 
@@ -719,7 +724,9 @@ bool OIPComms::init_plc_tag(const String &tag_group_name, const String &tag_name
 		return false;
 	}
 
-	tag_group.init_count++;
+	// s7 increments init_count later, once its link is up (process_plc_tag_group)
+	if (tag_group.protocol != "s7")
+		tag_group.init_count++;
 	return true;
 }
 

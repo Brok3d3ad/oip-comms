@@ -6,7 +6,9 @@ int S7_tag_destroy(int identifier);
 
 int S7_tag_write(int tag);
 
-int S7_tag_read(int tag, int timeout);
+int S7_tag_connected(int tag);
+
+int S7_tag_flush(int tag);
 
 int S7_tag_get_bit(int32_t tag);
 
