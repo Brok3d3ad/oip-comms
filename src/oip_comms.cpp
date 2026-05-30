@@ -596,6 +596,16 @@ else {                                                                          
 void OIPComms::process_write(const WriteRequest &write_req) {
 	TagGroup &tag_group = tag_groups[write_req.tag_group_name];
 
+	// Sample how long this write sat in the queue before the worker
+	// picked it up. The "interesting" component of Godot->PLC latency
+	// the user can't see from the plc_tag_write call duration alone.
+	if (write_req.queued_us != 0) {
+		const uint64_t queue_delay_us = Time::get_singleton()->get_ticks_usec() - write_req.queued_us;
+		if (queue_delay_us < tag_group.write_queue_min_us) tag_group.write_queue_min_us = queue_delay_us;
+		if (queue_delay_us > tag_group.write_queue_max_us) tag_group.write_queue_max_us = queue_delay_us;
+		tag_group.write_queue_count++;
+	}
+
 	int32_t tag_pointer = -1;
 	if (tag_group.protocol != "opc_ua" && tag_group.protocol != "ads"
 			&& tag_group.protocol != "rtde" && tag_group.protocol != "mqtt") {
@@ -655,7 +665,23 @@ void OIPComms::process_write(const WriteRequest &write_req) {
 			}
 		}
 		else {
-			if (tag_pointer >= 0 && plc_tag_write(tag_pointer, timeout) == PLCTAG_STATUS_OK) {
+			int write_result = PLCTAG_STATUS_OK;
+			if (tag_pointer >= 0) {
+				const uint64_t start_us = Time::get_singleton()->get_ticks_usec();
+				write_result = plc_tag_write(tag_pointer, timeout);
+				const uint64_t elapsed_us = Time::get_singleton()->get_ticks_usec() - start_us;
+
+				// Record write latency regardless of success/failure so
+				// stalls and timeouts surface in the stats.
+				auto it = tag_groups.find(write_req.tag_group_name);
+				if (it != tag_groups.end()) {
+					TagGroup &tg = it->second;
+					if (elapsed_us < tg.write_min_us) tg.write_min_us = elapsed_us;
+					if (elapsed_us > tg.write_max_us) tg.write_max_us = elapsed_us;
+					tg.write_count++;
+				}
+			}
+			if (tag_pointer >= 0 && write_result == PLCTAG_STATUS_OK) {
 				tag_groups[write_req.tag_group_name].plc_tags[write_req.tag_name].dirty = true;
 			} else {
 				print("Failed to write tag: " + write_req.tag_name, true);
@@ -669,6 +695,11 @@ void OIPComms::process_tag_group(const String &tag_group_name) {
 	if (tag_group.has_error)
 		return;
 
+	// Time the whole sweep so the dock UI can show "how long is a poll
+	// cycle for this group?" -- this is what bounds the staleness of
+	// data Godot has from the PLC.
+	const uint64_t cycle_start_us = Time::get_singleton()->get_ticks_usec();
+
 	if (tag_group.protocol == "opc_ua") {
 		process_opc_ua_tag_group(tag_group_name);
 	} else if (tag_group.protocol == "ads") {
@@ -680,6 +711,11 @@ void OIPComms::process_tag_group(const String &tag_group_name) {
 	} else {
 		process_plc_tag_group(tag_group_name);
 	}
+
+	const uint64_t cycle_elapsed_us = Time::get_singleton()->get_ticks_usec() - cycle_start_us;
+	if (cycle_elapsed_us < tag_group.poll_cycle_min_us) tag_group.poll_cycle_min_us = cycle_elapsed_us;
+	if (cycle_elapsed_us > tag_group.poll_cycle_max_us) tag_group.poll_cycle_max_us = cycle_elapsed_us;
+	tag_group.poll_cycle_count++;
 }
 
 void OIPComms::process_plc_tag_group(const String &tag_group_name) {
@@ -739,7 +775,7 @@ void OIPComms::process_plc_tag_group(const String &tag_group_name) {
 			}
 		} else
 		if (tag.tag_pointer >= 0) {
-			if (!process_plc_read(tag, tag_name)) {
+			if (!process_plc_read(tag_group_name, tag, tag_name)) {
 				tag_group.has_error = true;
 				return;
 			} else {
@@ -1640,8 +1676,21 @@ bool OIPComms::tag_exists(const String& tag_group_name, const String& tag_name) 
 	return false;
 }
 
-bool OIPComms::process_plc_read(PlcTag &tag, const String &tag_name) {
-	int read_result = plc_tag_read(tag.tag_pointer, timeout);
+bool OIPComms::process_plc_read(const String &tag_group_name, PlcTag &tag, const String &tag_name) {
+	const uint64_t start_us = Time::get_singleton()->get_ticks_usec();
+	const int read_result = plc_tag_read(tag.tag_pointer, timeout);
+	const uint64_t elapsed_us = Time::get_singleton()->get_ticks_usec() - start_us;
+
+	// Record latency for the round-trip regardless of success/failure so
+	// timeouts and error stalls are visible in the stats.
+	auto it = tag_groups.find(tag_group_name);
+	if (it != tag_groups.end()) {
+		TagGroup &tg = it->second;
+		if (elapsed_us < tg.read_min_us) tg.read_min_us = elapsed_us;
+		if (elapsed_us > tg.read_max_us) tg.read_max_us = elapsed_us;
+		tg.read_count++;
+	}
+
 	if (read_result != PLCTAG_STATUS_OK) {
 		print("Failed to read tag: " + tag_name, true);
 		return false;
@@ -1785,6 +1834,19 @@ void OIPComms::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("write_float32", "tag_group_name", "tag_name", "value"), &OIPComms::write_float32);
 
 	ClassDB::bind_method(D_METHOD("get_tag_groups"), &OIPComms::get_tag_groups);
+
+	ClassDB::bind_method(D_METHOD("get_read_latency_min_us", "tag_group_name"), &OIPComms::get_read_latency_min_us);
+	ClassDB::bind_method(D_METHOD("get_read_latency_max_us", "tag_group_name"), &OIPComms::get_read_latency_max_us);
+	ClassDB::bind_method(D_METHOD("get_read_latency_count", "tag_group_name"), &OIPComms::get_read_latency_count);
+	ClassDB::bind_method(D_METHOD("get_write_latency_min_us", "tag_group_name"), &OIPComms::get_write_latency_min_us);
+	ClassDB::bind_method(D_METHOD("get_write_latency_max_us", "tag_group_name"), &OIPComms::get_write_latency_max_us);
+	ClassDB::bind_method(D_METHOD("get_write_latency_count", "tag_group_name"), &OIPComms::get_write_latency_count);
+	ClassDB::bind_method(D_METHOD("get_write_queue_min_us", "tag_group_name"), &OIPComms::get_write_queue_min_us);
+	ClassDB::bind_method(D_METHOD("get_write_queue_max_us", "tag_group_name"), &OIPComms::get_write_queue_max_us);
+	ClassDB::bind_method(D_METHOD("get_write_queue_count", "tag_group_name"), &OIPComms::get_write_queue_count);
+	ClassDB::bind_method(D_METHOD("get_poll_cycle_min_us", "tag_group_name"), &OIPComms::get_poll_cycle_min_us);
+	ClassDB::bind_method(D_METHOD("get_poll_cycle_max_us", "tag_group_name"), &OIPComms::get_poll_cycle_max_us);
+	ClassDB::bind_method(D_METHOD("get_poll_cycle_count", "tag_group_name"), &OIPComms::get_poll_cycle_count);
 
 	ClassDB::bind_method(D_METHOD("clear_tag_groups"), &OIPComms::clear_tag_groups);
 
@@ -1974,6 +2036,24 @@ void OIPComms::set_sim_running(bool value) {
 		comms_error = false;
 		print("Sim running");
 
+		// Reset per-group read/write latency stats so each sim run starts
+		// fresh. The dock UI consumes these via
+		// get_{read,write}_latency_{min,max,count}_us.
+		for (auto &gx : tag_groups) {
+			gx.second.read_min_us = UINT64_MAX;
+			gx.second.read_max_us = 0;
+			gx.second.read_count = 0;
+			gx.second.write_min_us = UINT64_MAX;
+			gx.second.write_max_us = 0;
+			gx.second.write_count = 0;
+			gx.second.write_queue_min_us = UINT64_MAX;
+			gx.second.write_queue_max_us = 0;
+			gx.second.write_queue_count = 0;
+			gx.second.poll_cycle_min_us = UINT64_MAX;
+			gx.second.poll_cycle_max_us = 0;
+			gx.second.poll_cycle_count = 0;
+		}
+
 		// "One-Big-Tag" manifest discovery: for every ab_eip group, read
 		// OIP_*_NAMES STRING arrays from the controller and wire each
 		// registered PlcTag to its slot in the matching REAL/DINT buffer.
@@ -2025,6 +2105,86 @@ Array OIPComms::get_tag_groups() {
 	}
 
 	return groups;
+}
+
+int OIPComms::get_read_latency_min_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	const TagGroup &tg = it->second;
+	if (tg.read_min_us == UINT64_MAX) return 0; // no samples yet
+	return (int)tg.read_min_us;
+}
+
+int OIPComms::get_read_latency_max_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	return (int)it->second.read_max_us;
+}
+
+int OIPComms::get_read_latency_count(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	return (int)it->second.read_count;
+}
+
+int OIPComms::get_write_latency_min_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	const TagGroup &tg = it->second;
+	if (tg.write_min_us == UINT64_MAX) return 0; // no samples yet
+	return (int)tg.write_min_us;
+}
+
+int OIPComms::get_write_latency_max_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	return (int)it->second.write_max_us;
+}
+
+int OIPComms::get_write_latency_count(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	return (int)it->second.write_count;
+}
+
+int OIPComms::get_write_queue_min_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	const TagGroup &tg = it->second;
+	if (tg.write_queue_min_us == UINT64_MAX) return 0;
+	return (int)tg.write_queue_min_us;
+}
+
+int OIPComms::get_write_queue_max_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	return (int)it->second.write_queue_max_us;
+}
+
+int OIPComms::get_write_queue_count(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	return (int)it->second.write_queue_count;
+}
+
+int OIPComms::get_poll_cycle_min_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	const TagGroup &tg = it->second;
+	if (tg.poll_cycle_min_us == UINT64_MAX) return 0;
+	return (int)tg.poll_cycle_min_us;
+}
+
+int OIPComms::get_poll_cycle_max_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	return (int)it->second.poll_cycle_max_us;
+}
+
+int OIPComms::get_poll_cycle_count(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	return (int)it->second.poll_cycle_count;
 }
 
 void OIPComms::clear_tag_groups() {
@@ -2433,7 +2593,8 @@ OIP_READ_FUNC(float32, float, FLOAT)
 				c,                                                                                                                      \
 				p_tag_group_name,                                                                                                       \
 				p_tag_name,                                                                                                             \
-				p_value                                                                                                                 \
+				p_value,                                                                                                                \
+				Time::get_singleton()->get_ticks_usec()                                                                                 \
 			};                                                                                                                          \
 			write_queue.push(write_req);                                                                                                \
 			tag_group_queue.push("");                                                                                                   \

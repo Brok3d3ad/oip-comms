@@ -101,6 +101,50 @@ private:
 		MqttTagGroupImpl *mqtt_impl;
 
 		bool needs_session_recovered_signal = false;
+
+		// Per-group PLC request->response latency stats (microseconds).
+		// Read stats wrap each `plc_tag_read` call in process_plc_read;
+		// write stats wrap `plc_tag_write` in process_write. These measure
+		// the actual libplctag round-trip for legacy-path tags (manifest
+		// hot-path writes bypass the queue via auto_sync_write_ms and are
+		// not captured here -- libplctag drives those async on its own
+		// thread so the request->response time is not observable from
+		// this side).
+		//
+		// Worker thread writes these fields; main thread reads them via
+		// `get_{read,write}_latency_*_us` and resets them in
+		// `set_sim_running(true)`. Plain uint64_t (no mutex/atomic) to
+		// match the data-race-loose pattern used elsewhere in this class:
+		// 8-byte-aligned uint64_t reads/writes are non-tearing on x86 and
+		// monitoring stats tolerate transient inconsistency between
+		// min/max/count display values.
+		//
+		// Placed at the end so the aggregate initializer in
+		// `register_tag_group` doesn't need updating (default member
+		// initializers fill these).
+		uint64_t read_min_us = UINT64_MAX;
+		uint64_t read_max_us = 0;
+		uint64_t read_count = 0;
+		uint64_t write_min_us = UINT64_MAX;
+		uint64_t write_max_us = 0;
+		uint64_t write_count = 0;
+
+		// Write-queue delay (microseconds): time between the GDScript
+		// caller invoking write_##a and the worker thread actually
+		// starting process_write. Surfaces "Godot called write_bit, but
+		// the worker was busy doing reads / other writes."
+		uint64_t write_queue_min_us = UINT64_MAX;
+		uint64_t write_queue_max_us = 0;
+		uint64_t write_queue_count = 0;
+
+		// Poll-cycle duration (microseconds): wall time of a single
+		// process_tag_group dispatch -- i.e. the time to sweep every tag
+		// in this group on the wire. The interesting number for "how
+		// stale can Godot data be?" since fresh data is bounded by this
+		// + the worker's queue gap.
+		uint64_t poll_cycle_min_us = UINT64_MAX;
+		uint64_t poll_cycle_max_us = 0;
+		uint64_t poll_cycle_count = 0;
 	};
 	std::map<String, TagGroup> tag_groups;
 	std::vector<String> tag_group_order;
@@ -178,6 +222,11 @@ private:
 		String tag_group_name;
 		String tag_name;
 		Variant value;
+		// Time::get_ticks_usec() at the moment the GDScript caller invoked
+		// write_##a. Subtracted from the worker's process_write start to
+		// measure how long the request sat in the queue waiting for the
+		// worker to pick it up. 0 if not set (legacy callers).
+		uint64_t queued_us = 0;
 	};
 	std::queue<WriteRequest> write_queue;
 
@@ -244,7 +293,7 @@ private:
 	void process_write(const WriteRequest &write_req);
 
 	// process individual PLC read
-	bool process_plc_read(PlcTag &tag, const String &tag_name);
+	bool process_plc_read(const String &tag_group_name, PlcTag &tag, const String &tag_name);
 
 	void opc_write(const String &tag_group_name, const String &tag_path);
 
@@ -330,6 +379,30 @@ public:
 	String get_comms_error();
 
 	Array get_tag_groups();
+
+	// Per-group PLC request->response latency stats (microseconds).
+	// Read stats wrap each `plc_tag_read`; write stats wrap each
+	// `plc_tag_write`. count is the number of sampled calls. Reset on sim
+	// start. Note: returns 0 for a group with no samples yet (min would
+	// otherwise be UINT64_MAX).
+	int get_read_latency_min_us(const String p_tag_group_name);
+	int get_read_latency_max_us(const String p_tag_group_name);
+	int get_read_latency_count(const String p_tag_group_name);
+	int get_write_latency_min_us(const String p_tag_group_name);
+	int get_write_latency_max_us(const String p_tag_group_name);
+	int get_write_latency_count(const String p_tag_group_name);
+
+	// Write-queue delay (GDScript-call -> worker-start). Returns
+	// microseconds. 0 if no samples yet.
+	int get_write_queue_min_us(const String p_tag_group_name);
+	int get_write_queue_max_us(const String p_tag_group_name);
+	int get_write_queue_count(const String p_tag_group_name);
+
+	// Poll-cycle duration (full process_tag_group sweep). Returns
+	// microseconds. 0 if no samples yet.
+	int get_poll_cycle_min_us(const String p_tag_group_name);
+	int get_poll_cycle_max_us(const String p_tag_group_name);
+	int get_poll_cycle_count(const String p_tag_group_name);
 
 #define OIP_DECLARE_FUNC(a, b)                                          \
 	b read_##a(const String p_tag_group_name, const String p_tag_name); \
