@@ -125,9 +125,11 @@ private:
 		uint64_t read_min_us = UINT64_MAX;
 		uint64_t read_max_us = 0;
 		uint64_t read_count = 0;
+		uint64_t read_sum_us = 0; // running total; avg = sum / count (mean)
 		uint64_t write_min_us = UINT64_MAX;
 		uint64_t write_max_us = 0;
 		uint64_t write_count = 0;
+		uint64_t write_sum_us = 0; // running total; avg = sum / count (mean)
 
 		// Write-queue delay (microseconds): time between the GDScript
 		// caller invoking write_##a and the worker thread actually
@@ -136,6 +138,7 @@ private:
 		uint64_t write_queue_min_us = UINT64_MAX;
 		uint64_t write_queue_max_us = 0;
 		uint64_t write_queue_count = 0;
+		uint64_t write_queue_sum_us = 0; // running total; avg = sum / count (mean)
 
 		// Poll-cycle duration (microseconds): wall time of a single
 		// process_tag_group dispatch -- i.e. the time to sweep every tag
@@ -145,6 +148,7 @@ private:
 		uint64_t poll_cycle_min_us = UINT64_MAX;
 		uint64_t poll_cycle_max_us = 0;
 		uint64_t poll_cycle_count = 0;
+		uint64_t poll_cycle_sum_us = 0; // running total; avg = sum / count (mean)
 	};
 	std::map<String, TagGroup> tag_groups;
 	std::vector<String> tag_group_order;
@@ -172,6 +176,11 @@ private:
 		int elem_count = 0;
 		bool is_write_direction = false; // false = OIP_READ, true = OIP_WRITE
 		bool initialized = false;        // read buffer: first OK; write: at create
+		// Time::get_ticks_usec() when the most recent async read was kicked
+		// off (read buffers only). Used purely to populate the group's
+		// "Read call" latency stat on the sweep where that read completes --
+		// it does NOT change read scheduling. 0 = no read in flight yet.
+		uint64_t read_kicked_us = 0;
 	};
 	// Keyed by "<group_name>/<buffer_name>" with buffer_name in
 	// {OIP_READ, OIP_READ_DINT, OIP_WRITE, OIP_WRITE_DINT}. Pointers cached
@@ -385,23 +394,29 @@ public:
 	// `plc_tag_write`. count is the number of sampled calls. Reset on sim
 	// start. Note: returns 0 for a group with no samples yet (min would
 	// otherwise be UINT64_MAX).
+	// The *_avg variants return the arithmetic mean (sum / count) -- the
+	// "typical" latency, far less skewed by a lone spike than max.
 	int get_read_latency_min_us(const String p_tag_group_name);
 	int get_read_latency_max_us(const String p_tag_group_name);
+	int get_read_latency_avg_us(const String p_tag_group_name);
 	int get_read_latency_count(const String p_tag_group_name);
 	int get_write_latency_min_us(const String p_tag_group_name);
 	int get_write_latency_max_us(const String p_tag_group_name);
+	int get_write_latency_avg_us(const String p_tag_group_name);
 	int get_write_latency_count(const String p_tag_group_name);
 
 	// Write-queue delay (GDScript-call -> worker-start). Returns
 	// microseconds. 0 if no samples yet.
 	int get_write_queue_min_us(const String p_tag_group_name);
 	int get_write_queue_max_us(const String p_tag_group_name);
+	int get_write_queue_avg_us(const String p_tag_group_name);
 	int get_write_queue_count(const String p_tag_group_name);
 
 	// Poll-cycle duration (full process_tag_group sweep). Returns
 	// microseconds. 0 if no samples yet.
 	int get_poll_cycle_min_us(const String p_tag_group_name);
 	int get_poll_cycle_max_us(const String p_tag_group_name);
+	int get_poll_cycle_avg_us(const String p_tag_group_name);
 	int get_poll_cycle_count(const String p_tag_group_name);
 
 #define OIP_DECLARE_FUNC(a, b)                                          \

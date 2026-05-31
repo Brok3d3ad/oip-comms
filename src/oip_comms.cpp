@@ -603,6 +603,7 @@ void OIPComms::process_write(const WriteRequest &write_req) {
 		const uint64_t queue_delay_us = Time::get_singleton()->get_ticks_usec() - write_req.queued_us;
 		if (queue_delay_us < tag_group.write_queue_min_us) tag_group.write_queue_min_us = queue_delay_us;
 		if (queue_delay_us > tag_group.write_queue_max_us) tag_group.write_queue_max_us = queue_delay_us;
+		tag_group.write_queue_sum_us += queue_delay_us;
 		tag_group.write_queue_count++;
 	}
 
@@ -678,6 +679,7 @@ void OIPComms::process_write(const WriteRequest &write_req) {
 					TagGroup &tg = it->second;
 					if (elapsed_us < tg.write_min_us) tg.write_min_us = elapsed_us;
 					if (elapsed_us > tg.write_max_us) tg.write_max_us = elapsed_us;
+					tg.write_sum_us += elapsed_us;
 					tg.write_count++;
 				}
 			}
@@ -715,6 +717,7 @@ void OIPComms::process_tag_group(const String &tag_group_name) {
 	const uint64_t cycle_elapsed_us = Time::get_singleton()->get_ticks_usec() - cycle_start_us;
 	if (cycle_elapsed_us < tag_group.poll_cycle_min_us) tag_group.poll_cycle_min_us = cycle_elapsed_us;
 	if (cycle_elapsed_us > tag_group.poll_cycle_max_us) tag_group.poll_cycle_max_us = cycle_elapsed_us;
+	tag_group.poll_cycle_sum_us += cycle_elapsed_us;
 	tag_group.poll_cycle_count++;
 }
 
@@ -736,7 +739,23 @@ void OIPComms::process_plc_tag_group(const String &tag_group_name) {
 			if (st == PLCTAG_STATUS_OK) {
 				ab.initialized = true;
 				if (!ab.is_write_direction) {
+					// Instrumentation only -- the async kick model is
+					// unchanged. A read kicked on an earlier sweep has now
+					// completed, so record kick->completion latency to populate
+					// the dock's "Read call" stat for manifest groups (legacy
+					// groups get it from process_plc_read's blocking round-trip).
+					// This spans the inter-sweep gap, so it reflects data
+					// freshness latency rather than the raw wire round-trip.
+					const uint64_t now_us = Time::get_singleton()->get_ticks_usec();
+					if (ab.read_kicked_us != 0) {
+						const uint64_t elapsed_us = now_us - ab.read_kicked_us;
+						if (elapsed_us < tag_group.read_min_us) tag_group.read_min_us = elapsed_us;
+						if (elapsed_us > tag_group.read_max_us) tag_group.read_max_us = elapsed_us;
+						tag_group.read_sum_us += elapsed_us;
+						tag_group.read_count++;
+					}
 					plc_tag_read(ab.libplctag_handle, 0);
+					ab.read_kicked_us = now_us;
 				}
 			} else if (st == PLCTAG_STATUS_PENDING) {
 				// In flight; libplctag will complete it. Don't pile on.
@@ -744,6 +763,9 @@ void OIPComms::process_plc_tag_group(const String &tag_group_name) {
 				plc_tag_abort(ab.libplctag_handle);
 				if (!ab.is_write_direction) {
 					plc_tag_read(ab.libplctag_handle, 0);
+					// The aborted in-flight read is void; start a fresh latency
+					// window so we don't log a bogus kick->completion sample.
+					ab.read_kicked_us = Time::get_singleton()->get_ticks_usec();
 				}
 			}
 		}
@@ -1688,6 +1710,7 @@ bool OIPComms::process_plc_read(const String &tag_group_name, PlcTag &tag, const
 		TagGroup &tg = it->second;
 		if (elapsed_us < tg.read_min_us) tg.read_min_us = elapsed_us;
 		if (elapsed_us > tg.read_max_us) tg.read_max_us = elapsed_us;
+		tg.read_sum_us += elapsed_us;
 		tg.read_count++;
 	}
 
@@ -1837,15 +1860,19 @@ void OIPComms::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_read_latency_min_us", "tag_group_name"), &OIPComms::get_read_latency_min_us);
 	ClassDB::bind_method(D_METHOD("get_read_latency_max_us", "tag_group_name"), &OIPComms::get_read_latency_max_us);
+	ClassDB::bind_method(D_METHOD("get_read_latency_avg_us", "tag_group_name"), &OIPComms::get_read_latency_avg_us);
 	ClassDB::bind_method(D_METHOD("get_read_latency_count", "tag_group_name"), &OIPComms::get_read_latency_count);
 	ClassDB::bind_method(D_METHOD("get_write_latency_min_us", "tag_group_name"), &OIPComms::get_write_latency_min_us);
 	ClassDB::bind_method(D_METHOD("get_write_latency_max_us", "tag_group_name"), &OIPComms::get_write_latency_max_us);
+	ClassDB::bind_method(D_METHOD("get_write_latency_avg_us", "tag_group_name"), &OIPComms::get_write_latency_avg_us);
 	ClassDB::bind_method(D_METHOD("get_write_latency_count", "tag_group_name"), &OIPComms::get_write_latency_count);
 	ClassDB::bind_method(D_METHOD("get_write_queue_min_us", "tag_group_name"), &OIPComms::get_write_queue_min_us);
 	ClassDB::bind_method(D_METHOD("get_write_queue_max_us", "tag_group_name"), &OIPComms::get_write_queue_max_us);
+	ClassDB::bind_method(D_METHOD("get_write_queue_avg_us", "tag_group_name"), &OIPComms::get_write_queue_avg_us);
 	ClassDB::bind_method(D_METHOD("get_write_queue_count", "tag_group_name"), &OIPComms::get_write_queue_count);
 	ClassDB::bind_method(D_METHOD("get_poll_cycle_min_us", "tag_group_name"), &OIPComms::get_poll_cycle_min_us);
 	ClassDB::bind_method(D_METHOD("get_poll_cycle_max_us", "tag_group_name"), &OIPComms::get_poll_cycle_max_us);
+	ClassDB::bind_method(D_METHOD("get_poll_cycle_avg_us", "tag_group_name"), &OIPComms::get_poll_cycle_avg_us);
 	ClassDB::bind_method(D_METHOD("get_poll_cycle_count", "tag_group_name"), &OIPComms::get_poll_cycle_count);
 
 	ClassDB::bind_method(D_METHOD("clear_tag_groups"), &OIPComms::clear_tag_groups);
@@ -2043,15 +2070,19 @@ void OIPComms::set_sim_running(bool value) {
 			gx.second.read_min_us = UINT64_MAX;
 			gx.second.read_max_us = 0;
 			gx.second.read_count = 0;
+			gx.second.read_sum_us = 0;
 			gx.second.write_min_us = UINT64_MAX;
 			gx.second.write_max_us = 0;
 			gx.second.write_count = 0;
+			gx.second.write_sum_us = 0;
 			gx.second.write_queue_min_us = UINT64_MAX;
 			gx.second.write_queue_max_us = 0;
 			gx.second.write_queue_count = 0;
+			gx.second.write_queue_sum_us = 0;
 			gx.second.poll_cycle_min_us = UINT64_MAX;
 			gx.second.poll_cycle_max_us = 0;
 			gx.second.poll_cycle_count = 0;
+			gx.second.poll_cycle_sum_us = 0;
 		}
 
 		// "One-Big-Tag" manifest discovery: for every ab_eip group, read
@@ -2127,6 +2158,14 @@ int OIPComms::get_read_latency_count(const String p_tag_group_name) {
 	return (int)it->second.read_count;
 }
 
+int OIPComms::get_read_latency_avg_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	const TagGroup &tg = it->second;
+	if (tg.read_count == 0) return 0; // no samples yet
+	return (int)(tg.read_sum_us / tg.read_count);
+}
+
 int OIPComms::get_write_latency_min_us(const String p_tag_group_name) {
 	auto it = tag_groups.find(p_tag_group_name);
 	if (it == tag_groups.end()) return 0;
@@ -2145,6 +2184,14 @@ int OIPComms::get_write_latency_count(const String p_tag_group_name) {
 	auto it = tag_groups.find(p_tag_group_name);
 	if (it == tag_groups.end()) return 0;
 	return (int)it->second.write_count;
+}
+
+int OIPComms::get_write_latency_avg_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	const TagGroup &tg = it->second;
+	if (tg.write_count == 0) return 0; // no samples yet
+	return (int)(tg.write_sum_us / tg.write_count);
 }
 
 int OIPComms::get_write_queue_min_us(const String p_tag_group_name) {
@@ -2167,6 +2214,14 @@ int OIPComms::get_write_queue_count(const String p_tag_group_name) {
 	return (int)it->second.write_queue_count;
 }
 
+int OIPComms::get_write_queue_avg_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	const TagGroup &tg = it->second;
+	if (tg.write_queue_count == 0) return 0; // no samples yet
+	return (int)(tg.write_queue_sum_us / tg.write_queue_count);
+}
+
 int OIPComms::get_poll_cycle_min_us(const String p_tag_group_name) {
 	auto it = tag_groups.find(p_tag_group_name);
 	if (it == tag_groups.end()) return 0;
@@ -2185,6 +2240,14 @@ int OIPComms::get_poll_cycle_count(const String p_tag_group_name) {
 	auto it = tag_groups.find(p_tag_group_name);
 	if (it == tag_groups.end()) return 0;
 	return (int)it->second.poll_cycle_count;
+}
+
+int OIPComms::get_poll_cycle_avg_us(const String p_tag_group_name) {
+	auto it = tag_groups.find(p_tag_group_name);
+	if (it == tag_groups.end()) return 0;
+	const TagGroup &tg = it->second;
+	if (tg.poll_cycle_count == 0) return 0; // no samples yet
+	return (int)(tg.poll_cycle_sum_us / tg.poll_cycle_count);
 }
 
 void OIPComms::clear_tag_groups() {
