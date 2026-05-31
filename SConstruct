@@ -71,13 +71,16 @@ have_twincat_sdk = (
 
 if env["platform"] == "windows":
     env.Append(CXXFLAGS=["/MT", "/EHsc"])
-    env.Append(LIBS=["ws2_32"])
+    # Advapi32 supplies the CryptoAPI symbols (CryptAcquireContextA etc.) that
+    # Paho's SHA1.c pulls in for WebSocket support. Needed on every Windows
+    # build, not just the TwinCAT branch below.
+    env.Append(LIBS=["ws2_32", "Advapi32"])
     if have_twincat_sdk:
         print("ADS variant: TwinCAT (TcAdsDll detected at " + beckhoff_ads_root + ")")
         env.Append(CPPDEFINES=["USE_TWINCAT_ROUTER"])
         env.Append(CPPPATH=[beckhoff_ads_root + "/Include"])
         env.Append(LIBPATH=[beckhoff_ads_root + "/Lib/x64"])
-        env.Append(LIBS=["TcAdsDll", "delayimp", "Advapi32"])
+        env.Append(LIBS=["TcAdsDll", "delayimp"])
         # Delay-load so preload_tc_ads_dll() can resolve TcAdsDll from its
         # install path before any import is touched — works around stale PATH
         # in host processes started before TwinCAT was installed.
